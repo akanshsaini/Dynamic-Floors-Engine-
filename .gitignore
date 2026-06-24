@@ -1,0 +1,30 @@
+# Secrets & local config
+.env
+.config.json
+.claude/
+
+# Telemetry / data (large, local, regenerated at runtime)
+ml_telemetry.db
+historic_ml_data.csv
+historic_uploads.csv
+uploads/
+outputs/
+*.xlsx
+
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# Logs
+*.log
+server.err.log
+
+# Scratch / scratchpads / shortcuts
+scratch/
+*.lnk
+app_part1.txt
+app_part2.txt
+app_middle.txt
+diff.txt
+output.txt
