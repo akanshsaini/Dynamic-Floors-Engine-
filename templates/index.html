@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Dynamic floor price optimization for ad units.">
+    <title>Ad Floor Studio</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css?v=20">
+</head>
+<body>
+<div class="app">
+
+    <!-- Header -->
+    <header class="hdr">
+        <div class="hdr-l">
+            <div class="logo">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M7 14l3-4 3 3 5-7"/></svg>
+            </div>
+            <div>
+                <h1>Ad Floor <b>Studio</b></h1>
+                <div class="sub">Dynamic floor optimization · revenue &amp; RPM uplift</div>
+            </div>
+        </div>
+        <span class="hdr-pill">RPM-primary engine</span>
+    </header>
+
+    <!-- Upload -->
+    <section class="upload-wrap" id="upload-wrap">
+        <div class="upload-card">
+            <div class="upload-head">
+                <h2>Analyze your inventory</h2>
+                <p>Drop a performance report to get optimized floors. Add a bid-landscape report for true RPM.</p>
+            </div>
+            <div class="drops">
+                <div class="drop" id="drop-main">
+                    <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                    <h3>Performance report</h3>
+                    <p>CSV from your ad server · drag &amp; drop or click</p>
+                    <input type="file" id="file-main" accept=".csv" hidden>
+                    <div class="file-chip" id="chip-main"><span id="name-main"></span><span class="x" id="x-main">&times;</span></div>
+                </div>
+                <div class="drop" id="drop-bid">
+                    <span class="opt-tag">Optional</span>
+                    <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M7 13l4-4 3 3 5-6"/></svg>
+                    <h3>Bid landscape</h3>
+                    <p>Adds request / fill data so RPM &amp; true yield compute</p>
+                    <input type="file" id="file-bid" accept=".csv" hidden>
+                    <div class="file-chip" id="chip-bid"><span id="name-bid"></span><span class="x" id="x-bid">&times;</span></div>
+                </div>
+            </div>
+            <div class="analyze-row">
+                <button class="btn-go" id="btn-go" disabled>
+                    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+                    Analyze
+                </button>
+            </div>
+        </div>
+    </section>
+
+    <!-- Loading -->
+    <div class="loader" id="loader">
+        <div class="orbit"><span></span><span></span></div>
+        <p>Crunching your inventory…</p>
+        <small>Optimizing floors, projecting RPM, scoring outcomes</small>
+    </div>
+
+    <!-- Error -->
+    <div class="err" id="err">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="13"/><line x1="12" y1="16.5" x2="12" y2="16.6"/></svg>
+        <span id="err-msg"></span><span class="x" id="err-x">&times;</span>
+    </div>
+
+    <!-- Results -->
+    <section class="results" id="results">
+
+        <div class="kpis" id="kpis"></div>
+
+        <h3 class="sec-title">Key insights</h3>
+        <div class="insights" id="insights"></div>
+
+        <div class="tabs" id="tabs">
+            <span class="tab-glider" id="glider"></span>
+            <button class="tab active" data-tab="basic">Country &amp; Device <span class="cnt" id="cnt-basic">0</span></button>
+            <button class="tab" data-tab="detailed">Full Breakdown <span class="cnt" id="cnt-detailed">0</span></button>
+            <button class="tab" data-tab="site">Sites</button>
+            <button class="tab" data-tab="trends">Day-of-Week</button>
+            <button class="tab" data-tab="history">History</button>
+            <div class="tab-actions">
+                <button class="btn-dl" id="btn-dl">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                    Export CSV
+                </button>
+            </div>
+        </div>
+
+        <div class="meta" id="meta"></div>
+
+        <div class="search" id="search">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            <input type="text" id="search-in" placeholder="Search ad unit, country, device…">
+        </div>
+
+        <!-- Basic / Detailed share a host -->
+        <div class="panel on" id="panel-basic"><div class="tbl-wrap"><table class="tbl" id="t-basic"></table></div></div>
+        <div class="panel" id="panel-detailed"><div class="tbl-wrap"><table class="tbl" id="t-detailed"></table></div></div>
+
+        <div class="panel" id="panel-site">
+            <div class="sitekpis" id="site-kpis"></div>
+            <div class="tbl-wrap"><table class="tbl" id="t-site"></table></div>
+        </div>
+
+        <div class="panel" id="panel-trends">
+            <div class="trend-grid">
+                <div class="card">
+                    <h3>Network daily eCPM</h3>
+                    <div class="bars" id="net-bars"></div>
+                    <div class="note" id="net-note"></div>
+                </div>
+                <div class="card">
+                    <h3>Site daily eCPM <select id="site-sel"></select></h3>
+                    <div class="bars" id="site-bars"></div>
+                    <div class="note" id="site-note"></div>
+                </div>
+            </div>
+            <div class="card">
+                <h3>Weekday vs weekend &amp; floor actions</h3>
+                <div class="tbl-wrap" style="border:none;box-shadow:none"><table class="tbl" id="t-ww"></table></div>
+            </div>
+        </div>
+
+        <div class="panel" id="panel-history"><div id="history"></div></div>
+
+    </section>
+</div>
+<script src="/static/script.js?v=20"></script>
+</body>
+</html>
