@@ -406,11 +406,6 @@ def learn_from_followup_upload(followup_upload_id, df):
             followup_floor = float(observed['followup_floor'])
             applied_direction = _floor_direction(baseline_floor, followup_floor)
 
-            if predicted == 'No change':
-                applied = applied_direction == 'No change'
-            else:
-                applied = applied_direction == predicted or _close_to_floor(followup_floor, suggested_floor)
-
             baseline_imps = int(rec.get('raw_imps', 0) or 0)
             baseline_rev = float(rec.get('raw_rev', 0.0) or 0.0)
             baseline_ecpm = (baseline_rev / baseline_imps * 1000) if baseline_imps > 0 else 0.0
@@ -418,6 +413,24 @@ def learn_from_followup_upload(followup_upload_id, df):
             rev_change = _pct_change(observed['followup_rev'], baseline_rev)
             ecpm_change = _pct_change(observed['followup_ecpm'], baseline_ecpm)
             imp_change = _pct_change(observed['followup_imps'], baseline_imps)
+
+            # Self-match guard: consecutive uploads often cover OVERLAPPING report windows
+            # (e.g. two 30-day exports pulled days apart), so the "followup" aggregates are
+            # nearly identical to the baseline. That is the same window measured twice, not
+            # an outcome — storing it floods the loop with fake 0% results (this was why
+            # every per-segment outcome read 0.0%). Skip these entirely.
+            if abs(rev_change) < 0.005 and abs(imp_change) < 0.005 and abs(ecpm_change) < 0.005:
+                continue
+
+            if predicted == 'No change':
+                applied = applied_direction == 'No change'
+            else:
+                # An Increase/Decrease only counts as applied when the floor GENUINELY moved
+                # in the predicted direction (>=5% via _floor_direction). A floor sitting
+                # still is a non-event, not evidence about the recommendation.
+                applied = (applied_direction == predicted) or (
+                    _close_to_floor(followup_floor, suggested_floor)
+                    and applied_direction != 'No change')
             actual_direction, was_correct = _classify_outcome(
                 predicted, applied, rev_change, ecpm_change, imp_change
             )
@@ -701,6 +714,40 @@ def extract_learned_elasticity():
     except Exception as e:
         logging.error(f"Elasticity extraction failed: {e}")
         return default
+
+
+def get_cut_outcome_bias():
+    """
+    Per-segment memory of how FLOOR CUTS actually performed (measured, not modeled).
+    For each (ad_unit, country, device) where the engine previously decreased the floor and
+    it was applied, return the median realized revenue change. This is the do-no-harm signal:
+    where cutting demonstrably lost revenue (e.g. premium sites whose price collapsed), the
+    engine must stop cutting; where it won, the engine can press harder. Keyed the same way
+    the learning loop stores outcomes (normalized ad_unit + country + device).
+    Returns { (ad_unit, country, device): median_rev_change_pct }.
+    """
+    if not os.path.exists(DB_PATH):
+        return {}
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        # Comparable-window guard: sequential uploads cover shifting date ranges, so raw
+        # revenue deltas are inflated by traffic drift. Only score outcomes where volume
+        # stayed comparable (|imp change| <= 60%) and price didn't silently collapse.
+        df = pd.read_sql(f'''
+            SELECT ad_unit, country, device, rev_change_pct
+            FROM recommendation_outcomes
+            WHERE applied = 1 AND predicted_direction = 'Decrease'
+              AND ABS(imp_change_pct) <= 60 AND ecpm_change_pct > -30
+              AND {_RECENT_FILTER_OUTCOMES}
+        ''', conn)
+        conn.close()
+        if df.empty:
+            return {}
+        g = df.groupby(['ad_unit', 'country', 'device'])['rev_change_pct'].median()
+        return {(a, c, d): float(v) for (a, c, d), v in g.items()}
+    except Exception as e:
+        logging.error(f"Cut-outcome bias query failed: {e}")
+        return {}
 
 
 def get_realized_uplift():

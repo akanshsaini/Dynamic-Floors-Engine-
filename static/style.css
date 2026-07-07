@@ -68,8 +68,7 @@ body{
 .upload-head{text-align:center;margin-bottom:22px}
 .upload-head h2{font-size:1.3rem;font-weight:800;letter-spacing:-.02em}
 .upload-head p{color:var(--text-2);font-size:.85rem;margin-top:4px}
-.drops{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-@media(max-width:640px){.drops{grid-template-columns:1fr}}
+.drops{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px}
 .drop{position:relative;border:1.5px dashed var(--border-strong);border-radius:var(--r-lg);padding:30px 20px;
     text-align:center;cursor:pointer;transition:all .25s var(--ease);background:var(--surface-2)}
 .drop:hover{border-color:var(--indigo);background:var(--indigo-soft);transform:translateY(-3px);box-shadow:var(--sh-sm)}
