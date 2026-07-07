@@ -45,6 +45,11 @@ Z_SIGNIFICANCE      = 1.96    # ~95% confidence gate for declaring a metric gap 
 # until the DB has ≥3 applied outcomes to learn a real per-segment elasticity.
 DEFAULT_ELASTICITY  = {'increase': 0.5, 'decrease': 0.3}
 MIN_BIDS_LANDSCAPE  = 200      # Minimum bids in a segment before we trust its bid-landscape floor
+# Do-no-harm controller thresholds (measured revenue change of prior applied CUTS):
+CUT_LOSS_PCT        = -2.0     # prior cuts lost >2% revenue -> stop cutting this segment
+CUT_WIN_PCT         = 2.0      # prior cuts gained >2% -> press toward the bid optimum
+MAX_DOWN_UNPROVEN   = 0.35     # cap a cut at -35% until measured outcomes justify going deeper
+PROBE_PCT           = 0.12     # unproven changes ship as ±12% probes the next upload can score
 
 # ─── Column Detection ──────────────────────────────────────────────────────────
 COLUMN_ALIASES = {
@@ -118,6 +123,8 @@ def clean_ad_unit(val):
     return clean if clean else last
 
 
+
+
 def bid_join_key(ad_unit):
     """
     Normalize an ad-unit name to a stable site+position key for joining the performance
@@ -181,17 +188,18 @@ def map_os(val):
 # ─── Load & Clean CSV ──────────────────────────────────────────────────────────
 def load_and_clean(file_obj):
     content = file_obj.read().decode('utf-8', errors='replace')
-    lines = content.strip().split('\n')
-
-    # Auto-detect header row
+    # Auto-detect header row from the first ~30 lines only. Memory matters: these
+    # reports can be hundreds of MB — never build a full line list or rejoin the text.
+    head = content.split('\n', 31)[:30]
     header_idx = 0
-    for i, line in enumerate(lines[:30]):
+    for i, line in enumerate(head):
         ll = line.lower()
         if 'impression' in ll and 'revenue' in ll:
             header_idx = i
             break
 
-    df = pd.read_csv(io.StringIO('\n'.join(lines[header_idx:])), low_memory=False)
+    df = pd.read_csv(io.StringIO(content), skiprows=header_idx, low_memory=False)
+    del content
     col_map = detect_columns(df)
     missing = [c for c in REQUIRED if c not in col_map]
     if missing:
@@ -209,7 +217,12 @@ def load_and_clean(file_obj):
     df['browser']     = df['browser'].apply(map_browser) if 'browser' in df.columns else 'Other'
     df['os']          = df['os'].apply(map_os) if 'os' in df.columns else 'Other'
     if 'ssp' not in df.columns:
-        df['ssp'] = 'google_mcm'
+        # Derive SSP from the ad-unit network prefix: the Ellipsis network trades through
+        # the APAC MCM seat. (Previously everything was stamped google_mcm, which produced
+        # wrong ssp values on Ellipsis export rows.)
+        df['ssp'] = np.where(
+            df['ad_unit'].astype(str).str.lower().str.startswith('ellipsis'),
+            'google_mcm_apac', 'google_mcm')
     if 'country' not in df.columns:
         df['country'] = 'Unknown'
     if 'requests' in df.columns:
@@ -308,16 +321,17 @@ def load_bid_landscape(file_obj):
     try:
         raw = file_obj.read()
         text = raw.decode('utf-8', errors='replace')
-        lines = text.split('\n')
+        del raw
+        head = text.split('\n', 31)[:30]
         header_idx = 0
-        for i, line in enumerate(lines[:30]):
+        for i, line in enumerate(head):
             ll = line.lower()
             if ('bid' in ll or 'request' in ll or 'response' in ll) and ('ad unit' in ll or 'country' in ll or 'device' in ll):
                 header_idx = i
                 break
 
         # Detect columns from the header alone, then read only those (memory/speed).
-        head_df = pd.read_csv(io.StringIO('\n'.join(lines[header_idx:header_idx + 2])))
+        head_df = pd.read_csv(io.StringIO('\n'.join(head[header_idx:header_idx + 2])))
         col_map = detect_columns(head_df)
         if 'ad_unit' not in col_map:
             return {}, 'Bid landscape ignored: no ad-unit column found.'
@@ -325,7 +339,8 @@ def load_bid_landscape(file_obj):
         wanted = [k for k in ('ad_unit', 'country', 'device', 'requests', 'responses',
                               'unfilled', 'avg_bid_cpm', 'bids') if k in col_map]
         usecols = [col_map[k] for k in wanted]
-        df = pd.read_csv(io.StringIO('\n'.join(lines[header_idx:])), usecols=usecols, low_memory=False)
+        df = pd.read_csv(io.StringIO(text), skiprows=header_idx, usecols=usecols, low_memory=False)
+        del text
         df = df.rename(columns={col_map[k]: k for k in wanted})
 
         df['ad_unit'] = df['ad_unit'].apply(clean_ad_unit).apply(bid_join_key)  # site+position key
@@ -458,7 +473,7 @@ def _bid_confidence(bids):
 
 
 def recommend_floor(current_floor, perf, seg_ecpm, has_requests, ml_profile=None,
-                    elasticity=None, seg_bid=None):
+                    elasticity=None, seg_bid=None, cut_bias=None):
     """
     Core decision logic. Returns (suggested_floor, direction, change_pct, confidence, reason).
 
@@ -495,12 +510,27 @@ def recommend_floor(current_floor, perf, seg_ecpm, has_requests, ml_profile=None
         conf = _bid_confidence(bids)
         target = max(FLOOR_STEP, round(opt_f / FLOOR_STEP) * FLOOR_STEP)
         if current_floor > 0:
-            # How far down we're allowed to move this run, scaled by bid-data confidence.
-            max_down = {'High': 0.80, 'Medium': 0.65, 'Low': MAX_CHANGE_PCT}[conf]
-            # Only unlock the bigger move when the current floor is genuinely stranded
-            # above demand (clears <10% of bids); otherwise stay conservative.
-            if p_cur is not None and p_cur >= 0.10:
+            wants_cut = target < current_floor
+            # ── Do-no-harm controller (measured, not modeled) ──────────────────
+            # The bid report can't tell a "stranded" floor from a premium floor whose
+            # price would collapse if cut — only the realized outcome can. So size
+            # the cut by what cutting THIS segment actually did to revenue last period.
+            if wants_cut and cut_bias is not None and cut_bias <= CUT_LOSS_PCT:
+                return current_floor, 'No change', 0.0, conf, (
+                    f'Bid landscape suggests ${opt_f:.2f}, but measured outcomes show cutting '
+                    f'this segment lost revenue ({cut_bias:+.0f}%) — holding ${current_floor:.2f} '
+                    f'(price-support protected).')
+            # Treat near-zero bias as NO trustworthy evidence — stay gentle until the
+            # learning loop measures a real per-segment outcome from a later upload.
+            has_evidence = cut_bias is not None and abs(cut_bias) >= 1.0
+            if not wants_cut:
                 max_down = MAX_CHANGE_PCT
+            elif has_evidence and cut_bias >= CUT_WIN_PCT:
+                max_down = 0.50                       # proven winner: press, but never violently
+            elif has_evidence and cut_bias > CUT_LOSS_PCT:
+                max_down = 0.25                       # mild positive evidence
+            else:
+                max_down = MAX_DOWN_UNPROVEN          # unproven/noisy: gentle, then measure
             lo = current_floor * (1 - max_down)
             hi = current_floor * (1 + MAX_CHANGE_PCT)
             target = min(hi, max(lo, target))
@@ -725,10 +755,11 @@ def _build_reason(direction, cur, sug, pct, conf, cur_p, sug_p, is_volume_crash=
 
 # ─── Segment Analysis Pipeline ─────────────────────────────────────────────────
 def analyze_segment(seg_key, seg_df, df_full, has_requests, fallback_cols_list, fb_groups,
-                    ml_knowledge=None, elasticity_map=None, bid_map=None):
+                    ml_knowledge=None, elasticity_map=None, bid_map=None, cut_bias_map=None):
     if ml_knowledge is None: ml_knowledge = {}
     if elasticity_map is None: elasticity_map = {}
     if bid_map is None: bid_map = {}
+    if cut_bias_map is None: cut_bias_map = {}
 
     total_imps = float(seg_df['impressions'].sum())
     total_rev  = float(seg_df['revenue'].sum())
@@ -774,9 +805,32 @@ def analyze_segment(seg_key, seg_df, df_full, has_requests, fallback_cols_list, 
     ml_profile = ml_knowledge.get(seg_id, {})
     elasticity = elasticity_map.get(seg_id, elasticity_map.get('__global__', DEFAULT_ELASTICITY))
 
-    sug_floor, direction, change_pct, confidence, reason = recommend_floor(
-        current_floor, perf, seg_ecpm, has_requests, ml_profile, elasticity, seg_bid
+    # Measured do-no-harm signal: how prior CUTS to this segment actually performed.
+    cut_bias = cut_bias_map.get(
+        (db._normalize_ad_unit_key(seg_key.get('ad_unit', '')),
+         str(seg_key.get('country', '')), str(seg_key.get('device', '')))
     )
+    sug_floor, direction, change_pct, confidence, reason = recommend_floor(
+        current_floor, perf, seg_ecpm, has_requests, ml_profile, elasticity, seg_bid, cut_bias
+    )
+
+    # ── SELF-SUFFICIENT PROBE CONTROLLER (explore → measure → act) ──────────────
+    # The engine proves itself from its own reports: an unproven change is capped to a
+    # small PROBE the learning loop can score against the next performance upload.
+    # Once outcomes exist: winners are released to full size, losers are already held
+    # inside recommend_floor. This is the bandit loop — no external dashboard needed.
+    if direction != 'No change' and current_floor > 0:
+        has_proof = cut_bias is not None and abs(cut_bias) >= 1.0
+        proven_win = has_proof and cut_bias >= CUT_WIN_PCT
+        if not proven_win and change_pct > PROBE_PCT * 100:
+            sign = 1 if direction == 'Increase' else -1
+            sug_floor = max(FLOOR_STEP, round(current_floor * (1 + sign * PROBE_PCT) / FLOOR_STEP) * FLOOR_STEP)
+            change_pct = abs(sug_floor - current_floor) / current_floor * 100
+            if abs(sug_floor - current_floor) / current_floor < NO_CHANGE_BAND:
+                sug_floor, direction, change_pct = current_floor, 'No change', 0.0
+                reason = 'Probe rounds to current floor — holding.'
+            else:
+                reason += ' [Probe — capped move; next upload measures it, engine scales or reverts]'
 
     # Enforce a clean, importable floor: hard $0.25 minimum, snapped to $0.25 increments.
     # Reconcile direction/%-change after snapping so the UI and UPR export stay consistent.
@@ -871,9 +925,10 @@ def run_pipeline(df, has_requests, has_date, date_str="", bid_map=None, realized
     bid_map = bid_map or {}
     # Bid-landscape data also enables RPM reporting even without per-row request data
     has_requests = has_requests or bool(bid_map)
-    # Load historical ML engine knowledge + learned price elasticity
+    # Load historical ML engine knowledge + learned price elasticity + cut-outcome memory
     ml_knowledge = db.extract_ml_knowledge()
     elasticity_map = db.extract_learned_elasticity()
+    cut_bias_map = db.get_cut_outcome_bias()
 
     # ── Tab 1: Device – Country ──────────────────────────────────────────────
     b_group  = ['ad_unit', 'country', 'device', 'ssp']
@@ -887,7 +942,7 @@ def run_pipeline(df, has_requests, has_date, date_str="", bid_map=None, realized
         if not isinstance(keys, tuple):
             keys = (keys,)
         seg_key = dict(zip(b_group, keys))
-        b_res.append(analyze_segment(seg_key, seg, df, has_requests, b_fb, b_fbg, ml_knowledge, elasticity_map, bid_map))
+        b_res.append(analyze_segment(seg_key, seg, df, has_requests, b_fb, b_fbg, ml_knowledge, elasticity_map, bid_map, cut_bias_map))
 
     basic_full = pd.DataFrame(b_res)
     basic_out  = compress(basic_full, MAX_OUTPUT_ROWS, b_group)
@@ -905,7 +960,7 @@ def run_pipeline(df, has_requests, has_date, date_str="", bid_map=None, realized
         if not isinstance(keys, tuple):
             keys = (keys,)
         seg_key = dict(zip(d_group, keys))
-        d_res.append(analyze_segment(seg_key, seg, df, has_requests, d_fb, d_fbg, ml_knowledge, elasticity_map, bid_map))
+        d_res.append(analyze_segment(seg_key, seg, df, has_requests, d_fb, d_fbg, ml_knowledge, elasticity_map, bid_map, cut_bias_map))
 
     detailed_full = pd.DataFrame(d_res)
     detailed_out  = compress(detailed_full, MAX_OUTPUT_ROWS, d_group)
@@ -1314,8 +1369,13 @@ def download():
             ad_unit_str = str(r.get('ad_unit', ''))
             # Prefer the SSP carried on the row; default to google_mcm_apac for APAC-truncated
             # ad-unit names, else google_mcm.
-            default_ssp = 'google_mcm_apac' if ('...' in ad_unit_str or '…' in ad_unit_str) else 'google_mcm'
+            # APAC seat for Ellipsis-network units (also covers truncated '…' display names)
+            au_l = ad_unit_str.lower()
+            default_ssp = 'google_mcm_apac' if (au_l.startswith('ellipsis') or '...' in ad_unit_str
+                                                or '…' in ad_unit_str) else 'google_mcm'
             ssp = str(r.get('ssp') or default_ssp)
+            if ssp == 'google_mcm' and au_l.startswith('ellipsis'):
+                ssp = 'google_mcm_apac'  # correct rows stamped with the old generic default
 
             rows.append({
                 'country':  r.get('country', 'all'),

@@ -28,3 +28,6 @@ app_part2.txt
 app_middle.txt
 diff.txt
 output.txt
+
+# Automation lives in its own repository (dynamic-floors-automation)
+automation/
