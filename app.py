@@ -4,6 +4,8 @@ Decision engine: deterministic, data-grounded, UPR-ready output.
 UI and Excel export are guaranteed to show identical floors.
 """
 
+import datetime as _dt
+import hashlib
 import io
 import json
 import logging
@@ -50,6 +52,12 @@ CUT_LOSS_PCT        = -2.0     # prior cuts lost >2% revenue -> stop cutting thi
 CUT_WIN_PCT         = 2.0      # prior cuts gained >2% -> press toward the bid optimum
 MAX_DOWN_UNPROVEN   = 0.35     # cap a cut at -35% until measured outcomes justify going deeper
 PROBE_PCT           = 0.12     # unproven changes ship as ±12% probes the next upload can score
+# Exploration budget (manual-anchor mode): to beat — not just match — manual, deviate a
+# rotating slice of segments off the manual floor, measure, and promote winners.
+EXPLORE_EVERY       = 8        # ~1/8 = 12.5% of anchored segments explore each week
+EXPLORE_PROBE       = 0.12     # ±12% probe around the manual floor
+ANCHOR_BAND_UP      = 0.30     # promoted raises may exceed manual by up to +30%
+ANCHOR_BAND_DOWN    = 0.15     # promoted cuts may go up to 15% below manual
 
 # ─── Column Detection ──────────────────────────────────────────────────────────
 COLUMN_ALIASES = {
@@ -807,11 +815,13 @@ def analyze_segment(seg_key, seg_df, df_full, has_requests, fallback_cols_list, 
     ml_profile = ml_knowledge.get(seg_id, {})
     elasticity = elasticity_map.get(seg_id, elasticity_map.get('__global__', DEFAULT_ELASTICITY))
 
-    # Measured do-no-harm signal: how prior CUTS to this segment actually performed.
-    cut_bias = cut_bias_map.get(
-        (db._normalize_ad_unit_key(seg_key.get('ad_unit', '')),
-         str(seg_key.get('country', '')), str(seg_key.get('device', '')))
-    )
+    # Measured do-no-harm signal: how prior floor moves on this segment actually performed,
+    # per direction (cut_bias_map is now a directional map: {key: {'Decrease':x,'Increase':y}}).
+    _bkey = (db._normalize_ad_unit_key(seg_key.get('ad_unit', '')),
+             str(seg_key.get('country', '')), str(seg_key.get('device', '')))
+    _bias = cut_bias_map.get(_bkey, {})
+    cut_bias = _bias.get('Decrease') if isinstance(_bias, dict) else _bias
+    raise_bias = _bias.get('Increase') if isinstance(_bias, dict) else None
     sug_floor, direction, change_pct, confidence, reason = recommend_floor(
         current_floor, perf, seg_ecpm, has_requests, ml_profile, elasticity, seg_bid, cut_bias
     )
@@ -824,17 +834,11 @@ def analyze_segment(seg_key, seg_df, df_full, has_requests, fallback_cols_list, 
     # manual) and preserves the upside. Manual uses fine floors (down to $0.10),
     # so anchored floors snap to $0.05 — NOT the $0.25 min that was rejecting
     # cheap-inventory fill the human captures.
-    anchor = anchor_map.get(f"{bid_join_key(seg_key.get('ad_unit',''))}|"
-                            f"{seg_key.get('country','')}|{seg_key.get('device','')}")
+    anchor_key = (f"{bid_join_key(seg_key.get('ad_unit',''))}|"
+                  f"{seg_key.get('country','')}|{seg_key.get('device','')}")
+    anchor = anchor_map.get(anchor_key)
     if anchor is not None and anchor > 0:
-        proven_win = cut_bias is not None and abs(cut_bias) >= 1.0 and cut_bias >= CUT_WIN_PCT
-        if proven_win:
-            # measured proof: allow the engine's rec, but keep it in a do-no-harm band vs manual
-            target = min(anchor * 1.30, max(anchor * 0.85, sug_floor))
-            why = f'Manual-anchored ${anchor:.2f}; measured proof supports ${target:.2f}.'
-        else:
-            target = anchor  # match the proven manual floor
-            why = f'Seeded to proven manual floor ${anchor:.2f} (no measured proof to deviate yet).'
+        target, why = _anchored_floor(anchor, anchor_key, seg_bid, cut_bias, raise_bias)
         step = 0.05
         target = max(step, round(target / step) * step)
         if current_floor > 0 and abs(target - current_floor) / current_floor < NO_CHANGE_BAND:
@@ -896,6 +900,41 @@ def analyze_segment(seg_key, seg_df, df_full, has_requests, fallback_cols_list, 
 
     return _seg_result(seg_key, current_floor, sug_floor, direction, change_pct,
                        confidence, reason, total_imps, total_reqs, total_rev, used_fallback)
+
+
+def _anchored_floor(anchor, anchor_key, seg_bid, cut_bias, raise_bias):
+    """
+    Manual-anchor policy for one segment. Returns (target_floor, reason).
+
+      • PROMOTE: if measured outcomes prove moving off manual in a direction pays
+        (raise_bias / cut_bias >= CUT_WIN_PCT), deviate that way within a band.
+      • EXPLORE: else, on a rotating ~1/EXPLORE_EVERY weekly slice, probe ±EXPLORE_PROBE
+        around manual (direction hinted by the bid landscape) so the next cycle can
+        measure it. This is what lets the engine BEAT manual, not just mirror it.
+      • HOLD: otherwise sit exactly on the proven manual floor (safe default).
+    """
+    proven_raise = raise_bias is not None and raise_bias >= CUT_WIN_PCT
+    proven_cut = cut_bias is not None and cut_bias >= CUT_WIN_PCT
+    if proven_raise and (not proven_cut or raise_bias >= cut_bias):
+        target = min(anchor * (1 + ANCHOR_BAND_UP), max(anchor * 1.05, anchor * (1 + EXPLORE_PROBE)))
+        return target, f'Manual ${anchor:.2f} + measured raise-win ({raise_bias:+.0f}%) → ${target:.2f}.'
+    if proven_cut:
+        target = max(anchor * (1 - ANCHOR_BAND_DOWN), anchor * (1 - EXPLORE_PROBE))
+        return target, f'Manual ${anchor:.2f} + measured cut-win ({cut_bias:+.0f}%) → ${target:.2f}.'
+    # exploration budget — rotating weekly slice, deterministic per (segment, ISO week)
+    wk = _dt.date.today().isocalendar()[1]
+    digest = hashlib.md5(anchor_key.encode()).hexdigest()
+    h = int(digest[:8], 16)              # selection hash
+    hdir = int(digest[8:16], 16)         # INDEPENDENT direction hash (decorrelated from selection)
+    if (h + wk) % EXPLORE_EVERY == 0:
+        p = bid_prob_at_least(seg_bid, anchor) if seg_bid else None
+        if p is not None and p < 0.15:      sign = -1   # floor clears almost nothing → try lower
+        elif p is not None and p > 0.40:    sign = 1    # lots of demand clears → headroom to raise
+        else:                                sign = 1 if (hdir & 1) else -1
+        target = anchor * (1 + sign * EXPLORE_PROBE)
+        return target, (f'Exploring {sign*EXPLORE_PROBE*100:+.0f}% around manual ${anchor:.2f} '
+                        f'— measured next cycle, kept only if it wins.')
+    return anchor, f'Seeded to proven manual floor ${anchor:.2f} (holding; not in this week\'s explore slice).'
 
 
 def _seg_result(seg_key, current_floor, sug_floor, direction, change_pct,
@@ -990,7 +1029,7 @@ def run_pipeline(df, has_requests, has_date, date_str="", bid_map=None, realized
     # Load historical ML engine knowledge + learned price elasticity + cut-outcome memory
     ml_knowledge = db.extract_ml_knowledge()
     elasticity_map = db.extract_learned_elasticity()
-    cut_bias_map = db.get_cut_outcome_bias()
+    cut_bias_map = db.get_directional_bias()   # {key: {'Decrease':x,'Increase':y}} — promotion signal
 
     # ── Tab 1: Device – Country ──────────────────────────────────────────────
     b_group  = ['ad_unit', 'country', 'device', 'ssp']
