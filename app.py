@@ -755,11 +755,13 @@ def _build_reason(direction, cur, sug, pct, conf, cur_p, sug_p, is_volume_crash=
 
 # ─── Segment Analysis Pipeline ─────────────────────────────────────────────────
 def analyze_segment(seg_key, seg_df, df_full, has_requests, fallback_cols_list, fb_groups,
-                    ml_knowledge=None, elasticity_map=None, bid_map=None, cut_bias_map=None):
+                    ml_knowledge=None, elasticity_map=None, bid_map=None, cut_bias_map=None,
+                    anchor_map=None):
     if ml_knowledge is None: ml_knowledge = {}
     if elasticity_map is None: elasticity_map = {}
     if bid_map is None: bid_map = {}
     if cut_bias_map is None: cut_bias_map = {}
+    if anchor_map is None: anchor_map = {}
 
     total_imps = float(seg_df['impressions'].sum())
     total_rev  = float(seg_df['revenue'].sum())
@@ -814,6 +816,38 @@ def analyze_segment(seg_key, seg_df, df_full, has_requests, fallback_cols_list, 
         current_floor, perf, seg_ecpm, has_requests, ml_profile, elasticity, seg_bid, cut_bias
     )
 
+    # ── MANUAL-ANCHOR MODE (opt-in: only when an anchor map is supplied) ─────────
+    # The parent/control tags carry the AdOps team's manual floors, which beat the
+    # engine's from-scratch floors on eCPM. So when we have that policy, SEED the
+    # variant floor to the proven manual floor and deviate ONLY where measured
+    # outcomes justify it. This can't repeat the eCPM collapse (never far below
+    # manual) and preserves the upside. Manual uses fine floors (down to $0.10),
+    # so anchored floors snap to $0.05 — NOT the $0.25 min that was rejecting
+    # cheap-inventory fill the human captures.
+    anchor = anchor_map.get(f"{bid_join_key(seg_key.get('ad_unit',''))}|"
+                            f"{seg_key.get('country','')}|{seg_key.get('device','')}")
+    if anchor is not None and anchor > 0:
+        proven_win = cut_bias is not None and abs(cut_bias) >= 1.0 and cut_bias >= CUT_WIN_PCT
+        if proven_win:
+            # measured proof: allow the engine's rec, but keep it in a do-no-harm band vs manual
+            target = min(anchor * 1.30, max(anchor * 0.85, sug_floor))
+            why = f'Manual-anchored ${anchor:.2f}; measured proof supports ${target:.2f}.'
+        else:
+            target = anchor  # match the proven manual floor
+            why = f'Seeded to proven manual floor ${anchor:.2f} (no measured proof to deviate yet).'
+        step = 0.05
+        target = max(step, round(target / step) * step)
+        if current_floor > 0 and abs(target - current_floor) / current_floor < NO_CHANGE_BAND:
+            sug_floor, direction, change_pct = current_floor, 'No change', 0.0
+            reason = why + ' Already at target.'
+        else:
+            sug_floor = round(target, 2)
+            direction = 'Increase' if target > current_floor else 'Decrease'
+            change_pct = (abs(target - current_floor) / current_floor * 100) if current_floor > 0 else 100.0
+            reason = why
+        return _seg_result(seg_key, current_floor, sug_floor, direction, change_pct,
+                           confidence, reason, total_imps, total_reqs, total_rev, used_fallback)
+
     # ── SELF-SUFFICIENT PROBE CONTROLLER (explore → measure → act) ──────────────
     # The engine proves itself from its own reports: an unproven change is capped to a
     # small PROBE the learning loop can score against the next performance upload.
@@ -860,9 +894,14 @@ def analyze_segment(seg_key, seg_df, df_full, has_requests, fallback_cols_list, 
     if used_fallback and reason:
         reason += f' (Based on broader segment: {fallback_label})'
 
+    return _seg_result(seg_key, current_floor, sug_floor, direction, change_pct,
+                       confidence, reason, total_imps, total_reqs, total_rev, used_fallback)
+
+
+def _seg_result(seg_key, current_floor, sug_floor, direction, change_pct,
+                confidence, reason, total_imps, total_reqs, total_rev, used_fallback):
     ecpm = (total_rev / total_imps * 1000) if total_imps > 0 else 0.0
     rpm  = (total_rev / total_reqs * 1000) if total_reqs > 0 else 0.0
-
     r = dict(seg_key)
     r.update({
         'current_floor':    round(current_floor, 2),
@@ -920,9 +959,32 @@ def compress(df, max_rows, key_cols):
     return actionable.drop(columns=drop, errors='ignore')
 
 
+_ANCHOR_CACHE = {'mtime': None, 'map': {}}
+def load_manual_anchor(path='manual_anchor.json'):
+    """
+    Opt-in manual-floor anchor: if manual_anchor.json exists in the working dir, load it
+    (cached by mtime). Keys are 'sitekey|country|device' -> manual floor. Absent file =
+    empty map = engine behaves exactly as before (no anchoring). Never raises.
+    """
+    try:
+        if not os.path.exists(path):
+            return {}
+        mt = os.path.getmtime(path)
+        if _ANCHOR_CACHE['mtime'] != mt:
+            with open(path, encoding='utf-8') as f:
+                _ANCHOR_CACHE['map'] = json.load(f)
+            _ANCHOR_CACHE['mtime'] = mt
+            logging.info(f"Loaded manual anchor map: {len(_ANCHOR_CACHE['map']):,} segments.")
+        return _ANCHOR_CACHE['map']
+    except Exception as e:
+        logging.warning(f"Manual anchor load failed: {e}")
+        return {}
+
+
 # ─── Full Pipeline ─────────────────────────────────────────────────────────────
-def run_pipeline(df, has_requests, has_date, date_str="", bid_map=None, realized_uplift=None):
+def run_pipeline(df, has_requests, has_date, date_str="", bid_map=None, realized_uplift=None, anchor_map=None):
     bid_map = bid_map or {}
+    anchor_map = anchor_map or load_manual_anchor()
     # Bid-landscape data also enables RPM reporting even without per-row request data
     has_requests = has_requests or bool(bid_map)
     # Load historical ML engine knowledge + learned price elasticity + cut-outcome memory
@@ -942,7 +1004,7 @@ def run_pipeline(df, has_requests, has_date, date_str="", bid_map=None, realized
         if not isinstance(keys, tuple):
             keys = (keys,)
         seg_key = dict(zip(b_group, keys))
-        b_res.append(analyze_segment(seg_key, seg, df, has_requests, b_fb, b_fbg, ml_knowledge, elasticity_map, bid_map, cut_bias_map))
+        b_res.append(analyze_segment(seg_key, seg, df, has_requests, b_fb, b_fbg, ml_knowledge, elasticity_map, bid_map, cut_bias_map, anchor_map))
 
     basic_full = pd.DataFrame(b_res)
     basic_out  = compress(basic_full, MAX_OUTPUT_ROWS, b_group)
@@ -960,7 +1022,7 @@ def run_pipeline(df, has_requests, has_date, date_str="", bid_map=None, realized
         if not isinstance(keys, tuple):
             keys = (keys,)
         seg_key = dict(zip(d_group, keys))
-        d_res.append(analyze_segment(seg_key, seg, df, has_requests, d_fb, d_fbg, ml_knowledge, elasticity_map, bid_map, cut_bias_map))
+        d_res.append(analyze_segment(seg_key, seg, df, has_requests, d_fb, d_fbg, ml_knowledge, elasticity_map, bid_map, cut_bias_map, anchor_map))
 
     detailed_full = pd.DataFrame(d_res)
     detailed_out  = compress(detailed_full, MAX_OUTPUT_ROWS, d_group)

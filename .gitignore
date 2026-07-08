@@ -31,3 +31,6 @@ output.txt
 
 # Automation lives in its own repository (dynamic-floors-automation)
 automation/
+
+# Manual-floor anchor (derived from parent reports, operational data)
+manual_anchor.json
