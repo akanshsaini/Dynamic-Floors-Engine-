@@ -58,6 +58,10 @@ EXPLORE_EVERY       = 8        # ~1/8 = 12.5% of anchored segments explore each 
 EXPLORE_PROBE       = 0.12     # ±12% probe around the manual floor
 ANCHOR_BAND_UP      = 0.30     # promoted raises may exceed manual by up to +30%
 ANCHOR_BAND_DOWN    = 0.15     # promoted cuts may go up to 15% below manual
+# Manual desk's own objective (per AdOps): keep match rate ~1%..1.5% per ad unit.
+# We enforce the same band per country×device segment — finer than manual can.
+MATCH_LOW           = 0.010
+MATCH_HIGH          = 0.015
 
 # ─── Column Detection ──────────────────────────────────────────────────────────
 COLUMN_ALIASES = {
@@ -838,7 +842,8 @@ def analyze_segment(seg_key, seg_df, df_full, has_requests, fallback_cols_list, 
                   f"{seg_key.get('country','')}|{seg_key.get('device','')}")
     anchor = anchor_map.get(anchor_key)
     if anchor is not None and anchor > 0:
-        target, why = _anchored_floor(anchor, anchor_key, seg_bid, cut_bias, raise_bias)
+        match_rate = (total_imps / total_reqs) if total_reqs > 0 else None
+        target, why = _anchored_floor(anchor, anchor_key, seg_bid, cut_bias, raise_bias, match_rate)
         step = 0.05
         target = max(step, round(target / step) * step)
         if current_floor > 0 and abs(target - current_floor) / current_floor < NO_CHANGE_BAND:
@@ -902,7 +907,7 @@ def analyze_segment(seg_key, seg_df, df_full, has_requests, fallback_cols_list, 
                        confidence, reason, total_imps, total_reqs, total_rev, used_fallback)
 
 
-def _anchored_floor(anchor, anchor_key, seg_bid, cut_bias, raise_bias):
+def _anchored_floor(anchor, anchor_key, seg_bid, cut_bias, raise_bias, match_rate=None):
     """
     Manual-anchor policy for one segment. Returns (target_floor, reason).
 
@@ -928,7 +933,13 @@ def _anchored_floor(anchor, anchor_key, seg_bid, cut_bias, raise_bias):
     hdir = int(digest[8:16], 16)         # INDEPENDENT direction hash (decorrelated from selection)
     if (h + wk) % EXPLORE_EVERY == 0:
         p = bid_prob_at_least(seg_bid, anchor) if seg_bid else None
-        if p is not None and p < 0.15:      sign = -1   # floor clears almost nothing → try lower
+        # Direction priority: match-rate band (manual's own objective, finer-grained)
+        # → bid landscape → decorrelated hash.
+        if match_rate is not None and match_rate > MATCH_HIGH:
+            sign = 1    # filling too much → price is too cheap → raise
+        elif match_rate is not None and 0 < match_rate < MATCH_LOW:
+            sign = -1   # under-filling → floor too high → lower
+        elif p is not None and p < 0.15:    sign = -1   # floor clears almost nothing → try lower
         elif p is not None and p > 0.40:    sign = 1    # lots of demand clears → headroom to raise
         else:                                sign = 1 if (hdir & 1) else -1
         target = anchor * (1 + sign * EXPLORE_PROBE)
