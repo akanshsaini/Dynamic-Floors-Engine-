@@ -918,6 +918,11 @@ def _anchored_floor(anchor, anchor_key, seg_bid, cut_bias, raise_bias, match_rat
         measure it. This is what lets the engine BEAT manual, not just mirror it.
       • HOLD: otherwise sit exactly on the proven manual floor (safe default).
     """
+    # RECOVERY MODE (set by the automation on a revenue anomaly): replicate the
+    # proven manual floor exactly — no exploration, no promoted deviations. The
+    # safe harbor is the human's known-good config, not whatever we last tried.
+    if os.environ.get('FLOORS_RECOVERY') == '1':
+        return anchor, f'RECOVERY — replicating manual floor ${anchor:.2f} (revenue anomaly; exploration paused).'
     proven_raise = raise_bias is not None and raise_bias >= CUT_WIN_PCT
     proven_cut = cut_bias is not None and cut_bias >= CUT_WIN_PCT
     if proven_raise and (not proven_cut or raise_bias >= cut_bias):
