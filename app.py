@@ -938,14 +938,15 @@ def _anchored_floor(anchor, anchor_key, seg_bid, cut_bias, raise_bias, match_rat
     hdir = int(digest[8:16], 16)         # INDEPENDENT direction hash (decorrelated from selection)
     if (h + wk) % EXPLORE_EVERY == 0:
         p = bid_prob_at_least(seg_bid, anchor) if seg_bid else None
-        # Direction priority: match-rate band (manual's own objective, finer-grained)
-        # → bid landscape → decorrelated hash.
-        if match_rate is not None and match_rate > MATCH_HIGH:
-            sign = 1    # filling too much → price is too cheap → raise
-        elif match_rate is not None and 0 < match_rate < MATCH_LOW:
-            sign = -1   # under-filling → floor too high → lower
-        elif p is not None and p < 0.15:    sign = -1   # floor clears almost nothing → try lower
+        # Direction priority per industry practice: MEASURED DEMAND (bid landscape)
+        # first; the match-rate band is a useful desk heuristic but not a universal
+        # objective, so it is only the fallback hint; then a decorrelated hash.
+        if p is not None and p < 0.15:      sign = -1   # floor clears almost nothing → try lower
         elif p is not None and p > 0.40:    sign = 1    # lots of demand clears → headroom to raise
+        elif match_rate is not None and match_rate > MATCH_HIGH:
+            sign = 1    # filling too much → price likely too cheap → raise
+        elif match_rate is not None and 0 < match_rate < MATCH_LOW:
+            sign = -1   # under-filling → floor likely too high → lower
         else:                                sign = 1 if (hdir & 1) else -1
         target = anchor * (1 + sign * EXPLORE_PROBE)
         return target, (f'Exploring {sign*EXPLORE_PROBE*100:+.0f}% around manual ${anchor:.2f} '
