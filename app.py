@@ -115,10 +115,27 @@ SITE_ANCHOR_DISCOUNT = {}
 # revenue-maximising choice, not a retreat. Reviewed against each fresh even-split window;
 # a site earns its way back out by the same evidence that put it here.
 # Measured over Aug 12-20 2026 (9 days, 50/50 split, mix-adjusted per day x site):
-SITE_POLICY = {
-    'weetjewijzer_nl': 'manual',   # ahead 0 of 9 days, -11.5% RPM, -$20.50. Conclusive.
-    'socialnieuws_nl': 'manual',   # ahead 2 of 9 days,  -7.6% RPM, -$22.23, -22.4% fill.
-}
+SITE_POLICY = {}
+# 2026-09-07: weetjewijzer_nl and socialnieuws_nl UNPINNED.
+#
+# They were pinned on 2026-08-21 on nine days of even-split evidence (weetjewijzer ahead
+# 0 of 9, socialnieuws 2 of 9). That evidence is void. It was measured while the
+# per-ad-unit engine was colliding at tag level, and the collision had a systematic
+# UPWARD bias — a floor computed for an expensive position (pre, mid1) landed on the tag
+# and applied to the cheap ones too. Every live floor sat far above its anchor:
+#
+#   live floor vs manual anchor, measured 2026-09-07 on the pre-redesign rule set
+#     socialnieuws_nl   zero1 +229%   ellipsis +138%
+#     weetjewijzer_nl   zero1 +157%   ellipsis +150%
+#
+# socialnieuws was 138% above anchor while nominally "pinned to manual", so the pin never
+# actually held: what lost was not engine pricing, it was a corrupted floor. Both sites
+# have to be re-measured now that the engine decides at the deployable key and the pin
+# can mean what it says.
+#
+# Keep the MECHANISM — it is the right tool when a site genuinely cannot be beaten. Re-pin
+# only on evidence from a clean even-split window under the tag-level engine (earliest
+# 2026-09-09, since 2026-09-07 was priced by the old floors until 03:00).
 # Left on normal learning, deliberately:
 #   paparazzi_ar       +12.8% RPM, 9 of 9 days, +$36.73 — the engine's best proof.
 #   1point3acres        +6.7% RPM, 7 of 9 days, +$18.80.
