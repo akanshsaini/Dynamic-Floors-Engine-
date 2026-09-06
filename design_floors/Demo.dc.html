@@ -1,0 +1,132 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+    body { margin: 0; }
+    a { color: #0D5C63; } a:hover { color: #094A50; }
+  </style>
+</helmet>
+<div style="width: 900px; height: 620px; box-sizing: border-box; padding: 36px 40px; background: #EEF2F0; font-family: 'Segoe UI', system-ui, sans-serif; color: #2C3A37; display: flex; flex-direction: column; gap: 20px">
+
+  <div style="display: flex; flex-direction: column; gap: 7px">
+    <div style="font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; font-weight: 700; color: #5E6D69">Try it &mdash; one real ad slot</div>
+    <div style="font-family: Constantia, 'Palatino Linotype', Georgia, serif; font-size: 27px; line-height: 1.15; color: #16211F">What price does it ship, and why?</div>
+    <div style="font-size: 13px; color: #5E6D69; font-family: 'Cascadia Mono', Consolas, ui-monospace, monospace">1point3acres &middot; mid-article slot &middot; Portugal &middot; desktop &nbsp;&mdash;&nbsp; our team's price: <span style="color: #8F6330; font-weight: 600">$4.00</span></div>
+  </div>
+
+  <div style="display: grid; grid-template-columns: 330px minmax(0, 1fr); gap: 22px; flex-grow: 1">
+
+    <div style="display: flex; flex-direction: column; gap: 7px">
+      <div style="font-size: 11px; letter-spacing: 0.11em; text-transform: uppercase; font-weight: 700; color: #5E6D69; margin-bottom: 2px">What yesterday showed</div>
+      <sc-for list="{{scenarios}}" as="row" hint-placeholder-count="6">
+        <div onClick="{{ row.pick }}" style="{{ row.rowStyle }}">
+          <div style="font-size: 13px; font-weight: 600; line-height: 1.35">{{ row.label }}</div>
+          <div style="font-size: 11.5px; color: #5E6D69; margin-top: 2px">{{ row.sub }}</div>
+        </div>
+      </sc-for>
+    </div>
+
+    <div style="background: #FBFCFB; border: 1px solid #D3DCD8; border-radius: 11px; padding: 22px 26px; display: flex; flex-direction: column; gap: 16px">
+
+      <div style="display: flex; align-items: baseline; gap: 10px">
+        <div style="font-size: 10px; letter-spacing: 0.11em; text-transform: uppercase; font-weight: 700; color: {{ activeTone }}; background: {{ activeToneBg }}; padding: 4px 10px; border-radius: 20px">{{ activeRule }}</div>
+      </div>
+
+      <div style="display: flex; align-items: flex-end; gap: 30px; height: 196px">
+
+        <div style="display: flex; flex-direction: column; align-items: center; gap: 7px">
+          <div style="font-family: 'Cascadia Mono', Consolas, monospace; font-size: 14px; color: #8F6330; font-weight: 600">$4.00</div>
+          <div style="width: 62px; height: 160px; background: #F2E7D8; border: 1px solid #D2B489; border-radius: 4px 4px 0 0"></div>
+          <div style="font-size: 11px; color: #5E6D69; letter-spacing: 0.05em">BY HAND</div>
+        </div>
+
+        <div style="display: flex; flex-direction: column; align-items: center; gap: 7px">
+          <div style="font-family: 'Cascadia Mono', Consolas, monospace; font-size: 21px; color: #0D5C63; font-weight: 700">{{ activePrice }}</div>
+          <div style="width: 62px; height: {{ activeBar }}; background: #DCEAEA; border: 1.5px solid #0D5C63; border-radius: 4px 4px 0 0"></div>
+          <div style="font-size: 11px; color: #5E6D69; letter-spacing: 0.05em">SHIPPED</div>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 5px; padding-bottom: 24px">
+          <div style="font-family: Constantia, Georgia, serif; font-size: 29px; line-height: 1; color: {{ activeTone }}">{{ activeDelta }}</div>
+          <div style="font-size: 11.5px; color: #5E6D69">vs our team's price</div>
+        </div>
+
+      </div>
+
+      <div style="font-size: 13px; line-height: 1.55; border-top: 1px solid #D3DCD8; padding-top: 14px; flex-grow: 1">{{ activeWhy }}</div>
+
+    </div>
+
+  </div>
+
+  <div style="font-size: 11.5px; color: #5E6D69; line-height: 1.5">Every price above is what the live engine actually returns for this slot &mdash; not an illustration. Cuts may go deep because cutting is measured to earn more; raises stop at +12% because raising is measured to lose.</div>
+
+</div>
+</x-dc>
+<script data-dc-script data-props='{"$preview":{"width":900,"height":620}}'>
+class Component extends DCLogic {
+  constructor(props) {
+    super(props);
+    this.state = { picked: 'hold' };
+  }
+  rows() {
+    return [
+      { id: 'hold', label: 'Nothing measured yet', sub: 'no evidence either way',
+        rule: 'Hold', price: '$4.00', delta: 'same', bar: '160px',
+        tone: '#5E6D69', toneBg: '#EEF2F0',
+        why: 'The safe default, and where most slots sit on any given day. Without evidence that moving pays, it keeps the price a person chose. Doing nothing is a real answer.' },
+      { id: 'probe', label: 'Its turn to be tested', sub: 'a rotating slice each week',
+        rule: 'Small test', price: '$3.50', delta: '-12%', bar: '140px',
+        tone: '#0D5C63', toneBg: '#DCEAEA',
+        why: 'A deliberate nudge of 12% so tomorrow can measure it. Big earners get tested every other week, the smallest never: a test on a slot earning pennies could never be read, so it would only add churn.' },
+      { id: 'cut4', label: 'Cutting earned +4% here', sub: 'measured, modest evidence',
+        rule: 'Proven cut', price: '$3.20', delta: '-20%', bar: '128px',
+        tone: '#2F6F4F', toneBg: '#DEEDE4',
+        why: 'Evidence exists but it is thin, so the cut is thin too. Depth scales with the strength of the proof rather than jumping straight to the limit.' },
+      { id: 'cut12', label: 'Cutting earned +12% here', sub: 'measured, strong evidence',
+        rule: 'Proven cut, full depth', price: '$2.20', delta: '-45%', bar: '88px',
+        tone: '#2F6F4F', toneBg: '#DEEDE4',
+        why: 'Strong proof earns the deepest cut allowed. A lower price lets more advertisers into the auction: we earn less per sale but sell enough more to come out ahead. This is where the wins come from.' },
+      { id: 'raise5', label: 'Raising earned +5% here', sub: 'measured, but capped hard',
+        rule: 'Proven raise', price: '$4.50', delta: '+12%', bar: '180px',
+        tone: '#96661A', toneBg: '#F6EBD5',
+        why: 'Proven, and still only 12%. Across the whole estate, raising prices reliably loses money, so even good evidence buys a small step and no more. The asymmetry is deliberate.' },
+      { id: 'recovery', label: 'Revenue collapsed overnight', sub: 'two days running',
+        rule: 'Emergency stop', price: '$4.00', delta: 'same', bar: '160px',
+        tone: '#9C2E2A', toneBg: '#F6DFDD',
+        why: 'Every experiment switches off and every price snaps back to exactly what a person set. The safe harbour is the human configuration, not whatever we last tried.' }
+    ];
+  }
+  renderVals() {
+    const picked = this.state.picked;
+    const all = this.rows();
+    const active = all.find((r) => r.id === picked) || all[0];
+    const base = 'cursor: pointer; padding: 10px 13px; border-radius: 8px; border: 1px solid ';
+    return {
+      scenarios: all.map((r) => ({
+        label: r.label,
+        sub: r.sub,
+        pick: () => this.setState({ picked: r.id }),
+        rowStyle: r.id === picked
+          ? base + '#0D5C63; background: #FBFCFB; box-shadow: inset 3px 0 0 #0D5C63; color: #16211F'
+          : base + '#D3DCD8; background: rgba(251,252,251,0.5); color: #2C3A37'
+      })),
+      activeRule: active.rule,
+      activePrice: active.price,
+      activeDelta: active.delta,
+      activeBar: active.bar,
+      activeWhy: active.why,
+      activeTone: active.tone,
+      activeToneBg: active.toneBg
+    };
+  }
+}
+</script>
+</body>
+</html>
