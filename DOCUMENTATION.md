@@ -142,7 +142,8 @@ read "over-filling → raise", permanently pushing the direction measured to los
 | **Anomaly halt** | 2σ below the **weekday** baseline, floored 20% / capped 50%, needs 10 days history and **2 consecutive** qualifying days ⇒ RECOVERY | A fixed percentage sat under the noise floor and fired on 40–66% of days |
 | **No-op dedupe** | Floors identical to last push are dropped | Stops the blast-radius budget being spent on changes that change nothing |
 | **Blast radius** | ≤30% of segments/day, sorted by relative delta | It is a **prioritiser**, not just a limit — it guarantees highest-impact-first. Waived only under RECOVERY or `FLOORS_FULL_PUSH=1` |
-| **Auto-revert** | Restore previous floors where an ad unit underperformed **its own site** by 1.5σ below the median day-over-day move (40% floor / 80% ceiling, ≥$1.00 prior-day base, ≥12 units to trust calibration) | Site-relative on purpose: when *every* position of a site falls together (all six paparazzi breaks −80% on 2026-08-04) that is traffic, not pricing. Network-wide events are the anomaly rail's job — the two stay complementary |
+| **Dark tag** | A tag serving <2% of its own 14-day median requests, with a baseline ≥5,000 req/day ⇒ name it in the digest. **Alerts only, never acts** | Every other rail is blind to it: the anomaly rail watches *network* revenue, where one tag vanishing hides inside daily variance, and staleness watches floor age, not traffic. weetjewijzer_nl went to zero on both networks and in **both arms** on 2026-09-04 — 12.6% of zero1 and 21.6% of ellipsis engine revenue — undetected for 3 days while the engine shipped 135 rules/night to it. Reads the **raw** report: `load_and_clean` drops zero-impression rows, so a dead tag is absent downstream |
+| **Auto-revert** | Restore previous floors where an ad unit underperformed **its own site** by 1.5σ below the median day-over-day move (40% floor / 80% ceiling, ≥$1.00 prior-day base, ≥12 units to trust calibration) | Site-relative on purpose: when *every* position of a site falls together (all six paparazzi breaks −80% on 2026-08-04) that is traffic, not pricing. Network-wide events are the anomaly rail's job — the two stay complementary. **Under `TAG_LEVEL` the ad unit *is* the site**, so the site reference degenerates (`expected` collapses to `rev_y`, making the test unsatisfiable) and the rail falls back to the **network's** move — the reference must always be coarser than what it judges |
 
 Additional: statistical-significance gate, learned elasticity, eCPM winsorisation, duplicate-upload
 guard, `HOLD_UPLOAD` manual-review latch.
@@ -216,7 +217,7 @@ filmpjevandedag +8.5% (19/29), **weetjewijzer −4.6% (4/29 — a standing loss,
 | `app.py` | Engine. `_anchored_floor()` = §3; `analyze_segment()` wraps it, snaps and clamps |
 | `db.py` | Telemetry + learning loop (`cut_bias` / `raise_bias` come from here) |
 | `automation/run_cycle.py` | Orchestrator — §2 |
-| `automation/guardrails.py` | All five rails — §4 |
+| `automation/guardrails.py` | All six rails — §4 |
 | `automation/settings.py` | Every threshold |
 | `automation/build_anchor.py` | Rebuilds `manual_anchor_<net>.json` from control reports |
 | `automation/uploader.py` | Headless dashboard upload, self-authenticating |
