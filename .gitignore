@@ -31,3 +31,17 @@ output.txt
 
 # Automation lives in its own repository (dynamic-floors-automation)
 automation/
+
+# Manual-floor anchor (derived from parent reports, operational data)
+manual_anchor.json
+
+# Separate repo: github.com/akanshsaini/support_vdo.ai
+support-site/
+
+# Per-network manual anchors (operational data, rebuilt daily from control reports)
+manual_anchor_*.json
+*.bak
+
+# Design-canvas build artifact (2MB editor bundle); the .dc.html sources are the source
+design_floors/*.html
+!design_floors/*.dc.html

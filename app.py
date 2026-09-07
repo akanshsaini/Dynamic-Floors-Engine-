@@ -4,6 +4,8 @@ Decision engine: deterministic, data-grounded, UPR-ready output.
 UI and Excel export are guaranteed to show identical floors.
 """
 
+import datetime as _dt
+import hashlib
 import io
 import json
 import logging
@@ -50,6 +52,177 @@ CUT_LOSS_PCT        = -2.0     # prior cuts lost >2% revenue -> stop cutting thi
 CUT_WIN_PCT         = 2.0      # prior cuts gained >2% -> press toward the bid optimum
 MAX_DOWN_UNPROVEN   = 0.35     # cap a cut at -35% until measured outcomes justify going deeper
 PROBE_PCT           = 0.12     # unproven changes ship as ±12% probes the next upload can score
+# Exploration budget (manual-anchor mode): to beat — not just match — manual, deviate a
+# rotating slice of segments off the manual floor, measure, and promote winners.
+EXPLORE_EVERY       = 8        # ~1/8 = 12.5% of anchored segments explore each week
+EXPLORE_PROBE       = 0.12     # ±12% probe around the manual floor
+
+# ── REVENUE-WEIGHTED EXPLORATION BUDGET (2026-08-13) ─────────────────────────
+# Exploration used to be uniform-random (hash-only), so a segment earning
+# $0.001 got the same optimization budget as one earning $44/day. Measured
+# distribution over a 30-day report:
+#     zero1     33 segments (1.5%) carry 83% of revenue; ~2,000 carry <2%
+#     ellipsis  19 segments (1.3%) carry 73% of revenue; ~1,390 carry <2%
+# Probing the long tail cannot pay — the revenue is too small to measure a
+# result against, and every probe still consumes blast-radius budget and adds
+# churn. So the cadence now scales with revenue contribution.
+# Thresholds are TOTAL segment revenue over the report window (~30 days, the
+# standing GAM schedule); retune here if that window changes.
+EXPLORE_REV_HIGH    = 10.00    # top ~1.5% of segments, ~75-83% of revenue
+EXPLORE_REV_MID     = 1.00     # top ~5%, ~95% of revenue
+EXPLORE_REV_LOW     = 0.25     # top ~8-10%, ~98% of revenue
+EXPLORE_EVERY_HIGH  = 2        # big earners: explore ~every other week
+EXPLORE_EVERY_LOW   = 24       # small earners: rarely
+# below EXPLORE_REV_LOW -> never explore; hold the proven manual floor
+
+# ── STAGED WIDENING (2026-08-12) ─────────────────────────────────────────────
+# Three independent measurements agree that floors sit too HIGH:
+#   1. bid landscape — the posted-price optimum is BELOW manual on 88% (zero1) /
+#      93% (ellipsis) of segments; 94–96% need a move bigger than ±12%;
+#      floors currently clear just 1.8% / 0.2% of measured bids
+#   2. A/B scoreboard — engine runs ~12% under manual and is at parity (zero1) /
+#      +10.7% ad-req CPM (ellipsis)
+#   3. outcome telemetry — RAISING loses (median −8.4%, bootstrap CI excludes 0);
+#      cutting is neutral-to-positive
+# So the leash is widened ASYMMETRICALLY: cuts may go deeper as evidence accrues,
+# raises stay pinned near manual. We deliberately do NOT jump to the computed
+# optimum — that formula assumes the winner pays our floor, which is false in a
+# real auction, so it is an upper bound, not a forecast. Instead we step toward
+# it, measure, and let promotion ratchet.
+# ── PER-SITE ANCHOR DISCOUNT (2026-08-16) ────────────────────────────────────
+# Anchoring to manual assumes the variant tag faces the SAME demand curve as the
+# control tag. On socialnieuws_nl it demonstrably does not: at an IDENTICAL floor
+# ($9.25, NL/High-end/mid1) manual fills 0.496% while the variant fills 0.370%,
+# costing $8.14 in a week on that one segment. Measured across both networks over
+# 7 days:
+#     engine floor ABOVE manual  -> 78 segments, -$41.71
+#     engine floor BELOW manual  -> 31 segments,  +$7.01
+# Per-site seed discount: seed BELOW the manual anchor where a site is measured to
+# under-fill at manual's price. Keyed by site (bid_join_key prefix); absent = no discount.
+#
+# 2026-08-21: socialnieuws_nl REMOVED. The 20% discount shipped 2026-08-16 and did not
+# work — over the 9-day even-split window (Aug 12-20) the tag still ran -7.6% RPM and,
+# decisively, delivered 22.4% FEWER impressions than manual off equal pageviews. A lower
+# floor that fills LESS means price was never the binding constraint, so discounting
+# further cannot fix it. Site moved to SITE_POLICY 'manual' below pending an ad-ops
+# look at the fill gap. Keep this dict — the mechanism is sound, this site just wasn't
+# the right diagnosis.
+SITE_ANCHOR_DISCOUNT = {}
+
+# Per-site policy. 'manual' pins every segment on that site to the proven human floor:
+# no probes, no promoted deviations, no discount. Use it where a measured, equal-traffic
+# A/B says the engine cannot beat the desk on that site — holding is then the
+# revenue-maximising choice, not a retreat. Reviewed against each fresh even-split window;
+# a site earns its way back out by the same evidence that put it here.
+# Measured over Aug 12-20 2026 (9 days, 50/50 split, mix-adjusted per day x site):
+SITE_POLICY = {}
+# 2026-09-07: weetjewijzer_nl and socialnieuws_nl UNPINNED.
+#
+# They were pinned on 2026-08-21 on nine days of even-split evidence (weetjewijzer ahead
+# 0 of 9, socialnieuws 2 of 9). That evidence is void. It was measured while the
+# per-ad-unit engine was colliding at tag level, and the collision had a systematic
+# UPWARD bias — a floor computed for an expensive position (pre, mid1) landed on the tag
+# and applied to the cheap ones too. Every live floor sat far above its anchor:
+#
+#   live floor vs manual anchor, measured 2026-09-07 on the pre-redesign rule set
+#     socialnieuws_nl   zero1 +229%   ellipsis +138%
+#     weetjewijzer_nl   zero1 +157%   ellipsis +150%
+#
+# socialnieuws was 138% above anchor while nominally "pinned to manual", so the pin never
+# actually held: what lost was not engine pricing, it was a corrupted floor. Both sites
+# have to be re-measured now that the engine decides at the deployable key and the pin
+# can mean what it says.
+#
+# Keep the MECHANISM — it is the right tool when a site genuinely cannot be beaten. Re-pin
+# only on evidence from a clean even-split window under the tag-level engine (earliest
+# 2026-09-09, since 2026-09-07 was priced by the old floors until 03:00).
+# Left on normal learning, deliberately:
+#   paparazzi_ar       +12.8% RPM, 9 of 9 days, +$36.73 — the engine's best proof.
+#   1point3acres        +6.7% RPM, 7 of 9 days, +$18.80.
+#   filmpjevandedag_nl  -6.0% RPM, 4 of 9 days,  -$3.33 — daily swing is +17%..-24% on
+#     the smallest revenue base we have; 4/9 is not separable from noise. Pinning it
+#     would be acting on variance. Watch, do not touch.
+
+
+def _site_policy(anchor_key):
+    """Policy for the site an anchor key belongs to, or None. Prefix match on site."""
+    site = str(anchor_key).split('|')[0]
+    for _site, _pol in SITE_POLICY.items():
+        if site.startswith(_site):
+            return _pol
+    return None
+
+ANCHOR_BAND_UP      = 0.12     # raises stay TIGHT — measured to lose money
+ANCHOR_BAND_DOWN    = 0.45     # proven cuts may ratchet to −45% below manual
+CUT_RAMP_FULL_PCT   = 10.0     # cut_bias at/above this earns the full band depth
+DEEP_CUT_EVERY      = 16       # ~1/16 = 6.25% of segments get a DEEP cut probe/week
+DEEP_CUT_MIN        = 0.30     # a deep probe cuts at least 30% below manual
+DEEP_CUT_MAX        = 0.45     # ...and never more than 45% in one step
+DEEP_CUT_MAX_P      = 0.05     # only where the floor clears <5% of measured bids
+FLOOR_MIN_ABS       = 0.05     # never ship a floor below this, whatever the math says
+# The desk's 1%..1.5% match band is a HEURISTIC, not a law, and our own data rejects it.
+# Measured on the 2026-08-27 report (30-day window, true match rate = responses/requests):
+# revenue per 1,000 ad requests rises MONOTONICALLY with match rate on every single site —
+# there is no interior peak to steer into. Not one site peaks in 1%..1.5%.
+#
+#   yield per 1k requests    1point3acres  filmpje  paparazzi  socialnieuws  weetjewijzer
+#     match 0.8-1.0%               0.069     0.062      0.011         0.023         0.033
+#     match 1.0-1.5% (the band)    0.133     0.063      0.018         0.095         0.039
+#     match 2.0-3.0%               0.237     0.182      0.021         0.165         0.160
+#     match 5-10%                      ·         ·      0.026             ·         0.686
+#
+# Spearman of match rate vs yield: +0.22..+0.65 per site. Critically it also holds WITHIN
+# ad unit x country groups (median +0.535, positive in 81.4% of 429 groups), so it is not
+# merely "good inventory fills more" — controlling for the inventory, more fill still pays.
+# Yield at the top fill decile runs 7x-68x the bottom decile.
+#
+# Consequence: there is no upper trigger. Match rate above the old band is NOT a reason to
+# raise a floor; the evidence points the other way. The signal is used in one direction
+# only — to size and prioritise CUTS where fill is worst.
+MATCH_LOW           = 0.010    # retained: legacy direction hint in the explore rung
+MATCH_HIGH          = 0.015
+MATCH_OVERRIDE      = True     # set False to disable the match-driven cut entirely
+MATCH_MIN_REQS      = 200      # ignore segments too small for the rate to mean anything
+MATCH_CUT_MAX       = 0.35     # deepest cut this signal may earn on its own
+# Fire only on SEVERE under-fill — below this fraction of the site target.
+# Ungated it hits 98.6% of eligible segments and 95% of revenue: that is not an override,
+# it is a blanket repricing, and because this rung outranks the probes it would also stop
+# the engine exploring on almost everything and starve the outcome telemetry that is our
+# ground truth. Gated at 0.33 it hits 75% of segments but only 20.7% of revenue, because
+# badly under-filled segments are by definition the ones earning least (the worst-filled
+# half of the estate carries 6.8% of revenue). So the gate targets exactly where the
+# upside is and the downside is bounded, and leaves high-revenue near-target segments to
+# the measured cut/raise loop. Raise toward 1.0 to widen once this is measured.
+MATCH_SEVERE_RATIO  = 0.33
+
+# ─── BID-LANDSCAPE OPTIMUM AS A FIRST-CLASS SIGNAL ─────────────────────────────
+# We fetch ~85 MB of bid-range report per network per day and it decided 4 of 107
+# floors (3.7%, measured 2026-08-21) — because the landscape was only consulted in
+# the deep-probe rung, gated behind a 1-in-16 weekly slice AND p<5% AND seg_rev>=$1.
+# Coverage was never the problem: 99.6% of all bids already sit in a key with enough
+# volume to compute an optimum. The data was simply never asked.
+#
+# So consult it every run, wherever there are enough bids to trust it. It stays BELOW
+# measured outcomes — argmax f*P(bid>=f) is a model, and its revenue assumption (the
+# winner pays our floor) is false in a live auction, so a realised revenue result
+# outranks it. And the move toward it is clamped to the same asymmetric bands as
+# everything else: cuts may run deep, raises stop at +12%, because the model biases
+# high and raising is measured to lose.
+BID_OPT_ENABLED     = True
+BID_OPT_MIN_MOVE    = 0.10     # ignore optima within 10% of the anchor — pure churn
+# Per-site fill target: the level at/above which that site's yield stops improving in the
+# measured data. Below target the floor is provably leaving money on the table.
+# DELIBERATELY STATIC, not re-derived per run: cutting raises fill, which would raise an
+# auto-derived target, which would justify deeper cuts — a runaway loop. Re-derive by hand
+# from a fresh report (see the table above) and review the change.
+MATCH_TARGET_DEFAULT = 0.020
+MATCH_TARGET = {
+    '1point3acres':       0.025,   # yield still climbing at 2-3%, 33.6% of its revenue there
+    'filmpjevandedag_nl': 0.025,   # climbing through 2-3%
+    'socialnieuws_nl':    0.025,   # peaks 2-3%, collapses beyond — the one site with a top
+    'paparazzi_ar':       0.030,   # best bucket 5-10% but thin; 3% is the supported level
+    'weetjewijzer_nl':    0.050,   # best bucket 5-10% (moot while the site is pinned)
+}
 
 # ─── Column Detection ──────────────────────────────────────────────────────────
 COLUMN_ALIASES = {
@@ -123,6 +296,32 @@ def clean_ad_unit(val):
     return clean if clean else last
 
 
+
+
+# ─── TAG-LEVEL MODE ────────────────────────────────────────────────────────────
+# The dashboard cannot store a floor per ad unit. Uploads go in as "Tag-Specific
+# Rule": it resolves the ad-unit name to its TAG and stores one rule per
+#     tag x country x device x os x browser
+# Measured 2026-08-31: the engine was deciding 6,466 floors that collapsed into
+# 1,328 storable rules — 4.9 decisions per rule, disagreeing in 74% of cases with a
+# median spread of $2.50 and a worst case of $17.55. Whichever ad unit uploaded last
+# silently set the price for all the others.
+#
+# So the engine now decides AT the deployable key. Collapsing ad_unit to the tag
+# identity in load_and_clean propagates everywhere for free, because segmentation,
+# the bid join, the anchor lookup, the learning loop and the export all key off
+# ad_unit. It also repairs the learning loop: outcomes used to be attributed per ad
+# unit while the floor that produced them was a tag-level collision, so cut_bias was
+# being trained on mislabelled experiments.
+TAG_LEVEL = True
+_POS_RE = re.compile(r'_(mid|pre|post).*$')
+_TAG_REP = {}          # tag identity -> a real ad-unit name the dashboard can resolve
+
+
+def tag_key(ad_unit):
+    """The deployable identity: site/tag, with ad position and instance stripped.
+    Idempotent — tag_key(tag_key(x)) == tag_key(x) — so it is safe to re-apply."""
+    return _POS_RE.sub('', bid_join_key(ad_unit))
 
 
 def bid_join_key(ad_unit):
@@ -256,6 +455,40 @@ def load_and_clean(file_obj):
 
     # Remove total/summary rows
     df = df[~df['ad_unit'].str.lower().str.startswith('total', na=False)]
+
+    # ── COLLAPSE TO THE DEPLOYABLE KEY ───────────────────────────────────────
+    # Do this BEFORE any aggregation so every downstream group-by, join and
+    # telemetry key is already at tag level. Keep one real ad-unit name per tag so
+    # the export can still hand the dashboard something it can resolve.
+    if TAG_LEVEL and 'ad_unit' in df.columns:
+        _raw = df['ad_unit'].astype(str)
+        _tag = _raw.map(tag_key)
+        for t, a in zip(_tag, _raw):
+            if t not in _TAG_REP:
+                _TAG_REP[t] = a
+        _before = _raw.nunique()
+        df['ad_unit'] = _tag
+        logging.info('TAG_LEVEL: %d ad units collapsed to %d tags',
+                     _before, df['ad_unit'].nunique())
+
+    # TRUE match rate, computed BEFORE unfilled rows are dropped.
+    # The impressions>0 filter below removes exactly the requests that did NOT fill, so
+    # any ratio taken afterwards is measured only over inventory that already filled.
+    # Measured 2026-08-31: post-filter imps/requests reads 91% against a true rate of
+    # 1.12%, so every segment tripped the "match too high -> raise" branch in
+    # _anchored_floor — permanently pushing the one direction measured to lose money.
+    # GAM's own "Ad Exchange match rate" column is responses/requests (verified to
+    # correlate 1.0000 with it), so reproduce that definition here per segment.
+    if 'requests' in df.columns and 'responses' in df.columns:
+        _keys = [c for c in ('ad_unit', 'country', 'device', 'os', 'browser') if c in df.columns]
+        if _keys:
+            _agg = df.groupby(_keys, observed=True)[['requests', 'responses']].sum()
+            _agg['true_match_rate'] = (_agg['responses']
+                                       / _agg['requests'].where(_agg['requests'] > 0))
+            _agg = _agg.rename(columns={'requests': 'true_requests'})
+            df = df.merge(_agg[['true_requests', 'true_match_rate']],
+                          left_on=_keys, right_index=True, how='left')
+
     df = df[df['impressions'] > 0]
     df = df.reset_index(drop=True)
 
@@ -755,11 +988,13 @@ def _build_reason(direction, cur, sug, pct, conf, cur_p, sug_p, is_volume_crash=
 
 # ─── Segment Analysis Pipeline ─────────────────────────────────────────────────
 def analyze_segment(seg_key, seg_df, df_full, has_requests, fallback_cols_list, fb_groups,
-                    ml_knowledge=None, elasticity_map=None, bid_map=None, cut_bias_map=None):
+                    ml_knowledge=None, elasticity_map=None, bid_map=None, cut_bias_map=None,
+                    anchor_map=None):
     if ml_knowledge is None: ml_knowledge = {}
     if elasticity_map is None: elasticity_map = {}
     if bid_map is None: bid_map = {}
     if cut_bias_map is None: cut_bias_map = {}
+    if anchor_map is None: anchor_map = {}
 
     total_imps = float(seg_df['impressions'].sum())
     total_rev  = float(seg_df['revenue'].sum())
@@ -805,14 +1040,76 @@ def analyze_segment(seg_key, seg_df, df_full, has_requests, fallback_cols_list, 
     ml_profile = ml_knowledge.get(seg_id, {})
     elasticity = elasticity_map.get(seg_id, elasticity_map.get('__global__', DEFAULT_ELASTICITY))
 
-    # Measured do-no-harm signal: how prior CUTS to this segment actually performed.
-    cut_bias = cut_bias_map.get(
-        (db._normalize_ad_unit_key(seg_key.get('ad_unit', '')),
-         str(seg_key.get('country', '')), str(seg_key.get('device', '')))
-    )
+    # Measured do-no-harm signal: how prior floor moves on this segment actually performed,
+    # per direction (cut_bias_map is now a directional map: {key: {'Decrease':x,'Increase':y}}).
+    _bkey = (db._normalize_ad_unit_key(seg_key.get('ad_unit', '')),
+             str(seg_key.get('country', '')), str(seg_key.get('device', '')))
+    _bias = cut_bias_map.get(_bkey, {})
+    cut_bias = _bias.get('Decrease') if isinstance(_bias, dict) else _bias
+    raise_bias = _bias.get('Increase') if isinstance(_bias, dict) else None
     sug_floor, direction, change_pct, confidence, reason = recommend_floor(
         current_floor, perf, seg_ecpm, has_requests, ml_profile, elasticity, seg_bid, cut_bias
     )
+
+    # ── MANUAL-ANCHOR MODE (opt-in: only when an anchor map is supplied) ─────────
+    # The parent/control tags carry the AdOps team's manual floors, which beat the
+    # engine's from-scratch floors on eCPM. So when we have that policy, SEED the
+    # variant floor to the proven manual floor and deviate ONLY where measured
+    # outcomes justify it. This can't repeat the eCPM collapse (never far below
+    # manual) and preserves the upside. Manual uses fine floors (down to $0.10),
+    # so anchored floors snap to $0.05 — NOT the $0.25 min that was rejecting
+    # cheap-inventory fill the human captures.
+    anchor_key = (f"{bid_join_key(seg_key.get('ad_unit',''))}|"
+                  f"{seg_key.get('country','')}|{seg_key.get('device','')}")
+    anchor = anchor_map.get(anchor_key)
+    if anchor is not None and anchor > 0:
+        # Prefer the TRUE match rate carried from before the unfilled-row filter
+        # (responses/requests, GAM's own definition). Falling back to imps/reqs here
+        # would measure fill only over inventory that already filled — see load_and_clean.
+        match_rate = None
+        if 'true_match_rate' in seg_df.columns:
+            _tm = pd.to_numeric(seg_df['true_match_rate'], errors='coerce').dropna()
+            if len(_tm):
+                match_rate = float(_tm.iloc[0])
+        if match_rate is None and total_reqs > 0:
+            match_rate = total_imps / total_reqs
+        # total_rev drives the revenue-weighted exploration budget: big earners get
+        # probed often, the long tail is held at the proven manual floor.
+        _treq = None
+        if 'true_requests' in seg_df.columns:
+            _tr = pd.to_numeric(seg_df['true_requests'], errors='coerce').dropna()
+            if len(_tr):
+                _treq = float(_tr.iloc[0])
+        target, why = _anchored_floor(anchor, anchor_key, seg_bid, cut_bias, raise_bias,
+                                      match_rate, seg_rev=total_rev, seg_reqs=_treq)
+        step = 0.05
+        target = max(step, round(target / step) * step)
+        # The $0.05 snap rounds to NEAREST, so it can round a *bounded* cut DOWN
+        # past its limit — a −45% target on a $0.85 anchor snapped to $0.45 (−47%).
+        # Re-assert the deepest allowed cut AFTER snapping, rounding up onto the grid.
+        deepest = max(FLOOR_MIN_ABS, anchor * (1 - max(ANCHOR_BAND_DOWN, DEEP_CUT_MAX)))
+        if target < deepest - 1e-9:
+            target = max(step, math.ceil(deepest / step) * step)
+        if current_floor > 0 and abs(target - current_floor) / current_floor < NO_CHANGE_BAND:
+            sug_floor, direction, change_pct = current_floor, 'No change', 0.0
+            reason = why + ' Already at target.'
+        else:
+            sug_floor = round(target, 2)
+            direction = 'Increase' if target > current_floor else 'Decrease'
+            change_pct = (abs(target - current_floor) / current_floor * 100) if current_floor > 0 else 100.0
+            reason = why
+        return _seg_result(seg_key, current_floor, sug_floor, direction, change_pct,
+                           confidence, reason, total_imps, total_reqs, total_rev, used_fallback)
+
+    # A pinned site with NO manual floor on record has nothing to pin to — and the
+    # from-scratch pricer below is exactly what the pin exists to keep off this site.
+    # So leave the segment alone rather than letting it fall through.
+    if _site_policy(anchor_key) == 'manual':
+        return _seg_result(seg_key, current_floor, current_floor, 'No change', 0.0,
+                           confidence,
+                           'SITE HOLD — site pinned to manual, and no manual floor on record '
+                           'for this segment. Leaving the live floor untouched.',
+                           total_imps, total_reqs, total_rev, used_fallback)
 
     # ── SELF-SUFFICIENT PROBE CONTROLLER (explore → measure → act) ──────────────
     # The engine proves itself from its own reports: an unproven change is capped to a
@@ -860,9 +1157,212 @@ def analyze_segment(seg_key, seg_df, df_full, has_requests, fallback_cols_list, 
     if used_fallback and reason:
         reason += f' (Based on broader segment: {fallback_label})'
 
+    return _seg_result(seg_key, current_floor, sug_floor, direction, change_pct,
+                       confidence, reason, total_imps, total_reqs, total_rev, used_fallback)
+
+
+def _explore_cadence(seg_rev):
+    """
+    How often this segment earns an exploration probe, by revenue contribution.
+    Returns the 'every N weeks' divisor, or 0 to never explore.
+
+    Uniform exploration wasted the budget: ~90% of segments earn under $0.25 per
+    30-day window and together account for <2% of revenue, so a probe there can
+    never be measured — it only burns blast-radius budget and adds churn.
+    """
+    if seg_rev is None:
+        return EXPLORE_EVERY                 # unknown revenue -> current behaviour
+    if seg_rev >= EXPLORE_REV_HIGH:
+        return EXPLORE_EVERY_HIGH            # the segments that actually pay
+    if seg_rev >= EXPLORE_REV_MID:
+        return EXPLORE_EVERY
+    if seg_rev >= EXPLORE_REV_LOW:
+        return EXPLORE_EVERY_LOW
+    return 0                                 # too small to ever measure
+
+
+def _anchored_floor(anchor, anchor_key, seg_bid, cut_bias, raise_bias, match_rate=None,
+                    seg_rev=None, seg_reqs=None):
+    """
+    Manual-anchor policy for one segment. Returns (target_floor, reason).
+
+      • PROMOTE: if measured outcomes prove moving off manual in a direction pays
+        (raise_bias / cut_bias >= CUT_WIN_PCT), deviate that way within a band.
+      • EXPLORE: else, on a rotating ~1/EXPLORE_EVERY weekly slice, probe ±EXPLORE_PROBE
+        around manual (direction hinted by the bid landscape) so the next cycle can
+        measure it. This is what lets the engine BEAT manual, not just mirror it.
+      • HOLD: otherwise sit exactly on the proven manual floor (safe default).
+    """
+    # RECOVERY MODE (set by the automation on a revenue anomaly): replicate the
+    # proven manual floor exactly — no exploration, no promoted deviations. The
+    # safe harbor is the human's known-good config, not whatever we last tried.
+    if os.environ.get('FLOORS_RECOVERY') == '1':
+        return anchor, f'RECOVERY — replicating manual floor ${anchor:.2f} (revenue anomaly; exploration paused).'
+
+    # EXPLOIT MODE (automation sets FLOORS_EXPLOIT=1 when state/EXPLOIT_MODE exists).
+    # Ship the best-KNOWN policy instead of experiments. Asymmetric on purpose:
+    #   • no RAISES at all — measured outcomes show raising loses revenue
+    #     (median −8.4%, bootstrap CI [−13.4,−2.5] excludes 0), and socialnieuws_nl
+    #     is that failure live: engine match rate 0.32% vs manual 0.42%, −13% CPM.
+    #   • no unproven DEEP probes — a −45% bet with no payoff inside the window.
+    #   • cuts are KEPT, because they are what produces the current wins
+    #     (paparazzi +24%, 1point3acres +21%, weetjewijzer +17% on ellipsis).
+    exploit = os.environ.get('FLOORS_EXPLOIT') == '1'
+
+    # SITE HOLD: on a site where an equal-traffic A/B measured the engine losing to the
+    # desk, ship the human's floor and nothing else. Checked before every other rung —
+    # including proven cuts — because the measurement that put the site here already
+    # accounts for whatever those rungs were doing. Holding IS the revenue-maximising
+    # move once the engine is demonstrably behind.
+    if _site_policy(anchor_key) == 'manual':
+        return anchor, (f'SITE HOLD — pinned to proven manual floor ${anchor:.2f}; measured A/B '
+                        f'shows the engine behind the desk on this site, so no deviation ships.')
+
+    # Per-site discount: where the variant tag is measured to under-fill at manual's
+    # price, seed below the anchor instead of at it. Applied to the anchor itself so
+    # every downstream path (hold, promote, explore, deep probe) inherits it.
+    site = str(anchor_key).split('|')[0]
+    for _site, _disc in SITE_ANCHOR_DISCOUNT.items():
+        if site.startswith(_site):
+            anchor = max(FLOOR_MIN_ABS, anchor * (1 - _disc))
+            break
+    proven_raise = raise_bias is not None and raise_bias >= CUT_WIN_PCT
+    proven_cut = cut_bias is not None and cut_bias >= CUT_WIN_PCT
+    if proven_raise and (not proven_cut or raise_bias >= cut_bias):
+        if exploit:
+            return anchor, (f'EXPLOIT — holding manual ${anchor:.2f}; raises are suppressed '
+                            f'(measured to lose revenue) despite raise-bias {raise_bias:+.0f}%.')
+        # Raises stay deliberately tight: measured outcomes show raising floors
+        # loses revenue, so a proven raise earns the band edge and no more.
+        target = anchor * (1 + ANCHOR_BAND_UP)
+        return target, f'Manual ${anchor:.2f} + measured raise-win ({raise_bias:+.0f}%) → ${target:.2f}.'
+    if proven_cut:
+        # RAMPED: depth scales with the strength of the measured evidence, from
+        # the probe size up to the full band. (Previously min()/max() pinned this
+        # to exactly ±12%, making the bands dead code — learning had no teeth.)
+        span = max(0.0, CUT_RAMP_FULL_PCT - CUT_WIN_PCT)
+        strength = 1.0 if span <= 0 else min(1.0, max(0.0, (cut_bias - CUT_WIN_PCT) / span))
+        depth = EXPLORE_PROBE + (ANCHOR_BAND_DOWN - EXPLORE_PROBE) * strength
+        target = anchor * (1 - depth)
+        return target, (f'Manual ${anchor:.2f} + measured cut-win ({cut_bias:+.0f}%) '
+                        f'→ −{depth*100:.0f}% = ${target:.2f}.')
+    # ── BID-LANDSCAPE OPTIMUM ─────────────────────────────────────────────────
+    # Where the measured bid distribution says the revenue-maximising posted price is
+    # materially away from the desk's floor, move toward it. Bounded on both sides —
+    # this is a model, not a measurement, so it never gets more rope than a proven
+    # outcome would. Sits above the under-fill heuristic because it uses the actual
+    # demand curve rather than inferring from fill.
+    if BID_OPT_ENABLED and not exploit and seg_bid:
+        best = bid_optimal_floor(seg_bid)          # honours MIN_BIDS_LANDSCAPE
+        if best:
+            opt = float(best[0])
+            if opt > 0 and abs(opt / anchor - 1.0) >= BID_OPT_MIN_MOVE:
+                lo = anchor * (1 - ANCHOR_BAND_DOWN)
+                hi = anchor * (1 + ANCHOR_BAND_UP)
+                target = max(lo, min(opt, hi))
+                target = max(target, FLOOR_MIN_ABS)
+                if abs(target / anchor - 1.0) >= 0.02:
+                    p_here = bid_prob_at_least(seg_bid, anchor)
+                    return target, (
+                        f'BID OPTIMUM — {seg_bid.get("bids", 0):,} measured bids put the '
+                        f'revenue-maximising price at ${opt:.2f}'
+                        + (f'; manual ${anchor:.2f} clears {p_here*100:.1f}% of them'
+                           if p_here is not None else f'; manual ${anchor:.2f}')
+                        + f'. Moving to ${target:.2f} ({(target/anchor-1)*100:+.0f}%, '
+                          f'clamped to the measured bands).')
+
+    # ── UNDER-FILL OVERRIDE (match-rate driven) ───────────────────────────────
+    # Measured: revenue per request rises monotonically with fill, per site and within
+    # ad unit x country. So a segment filling well under its site's target is leaving
+    # money on the table now — correct it rather than waiting for its turn in the
+    # explore rotation. CUT ONLY: there is no measured case for raising on high fill.
+    # Sits BELOW measured outcomes (a real revenue result outranks a heuristic) and
+    # ABOVE the probes (a known mispricing outranks a speculative one).
+    if (MATCH_OVERRIDE and not exploit and match_rate is not None and match_rate > 0
+            and (seg_reqs is None or seg_reqs >= MATCH_MIN_REQS)):
+        site_t = MATCH_TARGET_DEFAULT
+        for _s, _t in MATCH_TARGET.items():
+            if site.startswith(_s):
+                site_t = _t
+                break
+        if match_rate < site_t * MATCH_SEVERE_RATIO:
+            sev = min(1.0, (site_t - match_rate) / site_t)
+            depth = EXPLORE_PROBE + (MATCH_CUT_MAX - EXPLORE_PROBE) * sev
+            target = max(anchor * (1 - depth), FLOOR_MIN_ABS)
+            return target, (f'UNDER-FILL — matching {match_rate*100:.2f}% against a measured '
+                            f'target of {site_t*100:.1f}% for this site; the floor is blocking '
+                            f'demand that pays. Manual ${anchor:.2f} −{depth*100:.0f}% '
+                            f'= ${target:.2f}.')
+
+    # exploration budget — rotating weekly slice, deterministic per (segment, ISO week)
+    wk = _dt.date.today().isocalendar()[1]
+    digest = hashlib.md5(anchor_key.encode()).hexdigest()
+    h = int(digest[:8], 16)              # selection hash
+    hdir = int(digest[8:16], 16)         # INDEPENDENT direction hash (decorrelated from selection)
+    hdeep = int(digest[16:24], 16)       # INDEPENDENT deep-probe selection hash
+
+    # ── DEEP-CUT PROBE ────────────────────────────────────────────────────────
+    # A small rotating slice steps toward the MEASURED posted-price optimum, but
+    # only where the bid landscape proves the current floor is blocking almost all
+    # demand (p < DEEP_CUT_MAX_P). Bounded to [DEEP_CUT_MIN, DEEP_CUT_MAX] so we
+    # probe the direction without betting the network on a model whose revenue
+    # assumption (winner pays our floor) does not hold in a live auction.
+    # Deep probes are the most expensive experiment we run, so they are reserved
+    # for segments big enough that the result can actually be measured.
+    deep_eligible = (seg_rev is None) or (seg_rev >= EXPLORE_REV_MID)
+    if (hdeep + wk) % DEEP_CUT_EVERY == 0 and seg_bid and not exploit and deep_eligible:
+        p_here = bid_prob_at_least(seg_bid, anchor)
+        best = bid_optimal_floor(seg_bid)          # honours MIN_BIDS_LANDSCAPE
+        if p_here is not None and p_here < DEEP_CUT_MAX_P and best:
+            opt = best[0]
+            if opt < anchor:
+                lo = anchor * (1 - DEEP_CUT_MAX)   # deepest allowed this step
+                hi = anchor * (1 - DEEP_CUT_MIN)   # shallowest allowed this step
+                target = max(lo, min(opt, hi))
+                target = max(target, FLOOR_MIN_ABS)
+                return target, (
+                    f'DEEP PROBE — manual ${anchor:.2f} clears only {p_here*100:.1f}% of '
+                    f'measured bids; optimum ${opt:.2f}. Stepping to ${target:.2f} '
+                    f'(−{(1-target/anchor)*100:.0f}%) and measuring.')
+
+    cadence = _explore_cadence(seg_rev)
+    if cadence and (h + wk) % cadence == 0:
+        p = bid_prob_at_least(seg_bid, anchor) if seg_bid else None
+        # Direction priority per industry practice: MEASURED DEMAND (bid landscape)
+        # first; the match-rate band is a useful desk heuristic but not a universal
+        # objective, so it is only the fallback hint; then a decorrelated hash.
+        if p is not None and p < 0.15:      sign = -1   # floor clears almost nothing → try lower
+        elif p is not None and p > 0.40:    sign = 1    # lots of demand clears → headroom to raise
+        elif match_rate is not None and 0 < match_rate < MATCH_LOW:
+            sign = -1   # under-filling → floor likely too high → lower
+        # NOTE: there is deliberately no "match rate high → raise" branch. It was here, and
+        # the 2026-08-31 analysis refuted it: revenue per request rises monotonically with
+        # fill on every site, and within ad unit x country too (median Spearman +0.535).
+        # High fill is where we earn MOST, so it is not a reason to raise the floor.
+        else:                                sign = 1 if (hdir & 1) else -1
+        if exploit:
+            # Suppress ALL unproven probes, not just raises. The floors that are
+            # currently winning stay live via the no-op dedupe — they do not depend
+            # on new probes — so exploration only adds variance here. That matters
+            # doubly now that the budget is revenue-weighted: probes concentrate on
+            # the top ~26 segments (34% of revenue) at 1-in-2 cadence, which is the
+            # last thing you want churning on a day being measured.
+            side = 'RAISE' if sign > 0 else 'cut'
+            return anchor, (f'EXPLOIT — holding manual ${anchor:.2f}; unproven exploratory '
+                            f'{side} suppressed (proven moves still apply).')
+        target = max(anchor * (1 + sign * EXPLORE_PROBE), FLOOR_MIN_ABS)
+        return target, (f'Exploring {sign*EXPLORE_PROBE*100:+.0f}% around manual ${anchor:.2f} '
+                        f'— measured next cycle, kept only if it wins.')
+    if cadence == 0:
+        return anchor, (f'Seeded to proven manual floor ${anchor:.2f} (holding; segment earns '
+                        f'${seg_rev:.2f} over the window — too small for a probe to be measurable).')
+    return anchor, f'Seeded to proven manual floor ${anchor:.2f} (holding; not in this week\'s explore slice).'
+
+
+def _seg_result(seg_key, current_floor, sug_floor, direction, change_pct,
+                confidence, reason, total_imps, total_reqs, total_rev, used_fallback):
     ecpm = (total_rev / total_imps * 1000) if total_imps > 0 else 0.0
     rpm  = (total_rev / total_reqs * 1000) if total_reqs > 0 else 0.0
-
     r = dict(seg_key)
     r.update({
         'current_floor':    round(current_floor, 2),
@@ -920,15 +1420,53 @@ def compress(df, max_rows, key_cols):
     return actionable.drop(columns=drop, errors='ignore')
 
 
+_ANCHOR_CACHE = {'mtime': None, 'map': {}}
+def load_manual_anchor(path=None):
+    """
+    Opt-in manual-floor anchor, cached by mtime. Keys are 'sitekey|country|device'
+    -> manual floor. Absent file = empty map = engine behaves exactly as before.
+    Never raises.
+
+    PER-NETWORK: both networks carry the same sites, so their anchor keys collide.
+    A single shared file let one network's floors overwrite the other's — measured
+    2026-08-15, zero1 was anchored to ellipsis's ladder at 0.42-0.61x its own true
+    manual floors, i.e. systematically under-priced. The automation sets
+    FLOORS_ANCHOR to the network-specific file for the network being processed;
+    we fall back to the legacy combined file only if that is absent.
+    """
+    try:
+        if path is None:
+            path = os.environ.get('FLOORS_ANCHOR') or 'manual_anchor.json'
+            if not os.path.exists(path):
+                path = 'manual_anchor.json'
+        if not os.path.exists(path):
+            return {}
+        mt = os.path.getmtime(path)
+        # Cache on (path, mtime): keying on mtime alone would serve one network's
+        # anchor to the other if both were ever loaded in the same process.
+        if _ANCHOR_CACHE.get('mtime') != mt or _ANCHOR_CACHE.get('path') != path:
+            with open(path, encoding='utf-8') as f:
+                _ANCHOR_CACHE['map'] = json.load(f)
+            _ANCHOR_CACHE['mtime'] = mt
+            _ANCHOR_CACHE['path'] = path
+            logging.info(f"Loaded manual anchor: {len(_ANCHOR_CACHE['map']):,} segments "
+                         f"from {os.path.basename(path)}.")
+        return _ANCHOR_CACHE['map']
+    except Exception as e:
+        logging.warning(f"Manual anchor load failed: {e}")
+        return {}
+
+
 # ─── Full Pipeline ─────────────────────────────────────────────────────────────
-def run_pipeline(df, has_requests, has_date, date_str="", bid_map=None, realized_uplift=None):
+def run_pipeline(df, has_requests, has_date, date_str="", bid_map=None, realized_uplift=None, anchor_map=None):
     bid_map = bid_map or {}
+    anchor_map = anchor_map or load_manual_anchor()
     # Bid-landscape data also enables RPM reporting even without per-row request data
     has_requests = has_requests or bool(bid_map)
     # Load historical ML engine knowledge + learned price elasticity + cut-outcome memory
     ml_knowledge = db.extract_ml_knowledge()
     elasticity_map = db.extract_learned_elasticity()
-    cut_bias_map = db.get_cut_outcome_bias()
+    cut_bias_map = db.get_directional_bias()   # {key: {'Decrease':x,'Increase':y}} — promotion signal
 
     # ── Tab 1: Device – Country ──────────────────────────────────────────────
     b_group  = ['ad_unit', 'country', 'device', 'ssp']
@@ -942,7 +1480,7 @@ def run_pipeline(df, has_requests, has_date, date_str="", bid_map=None, realized
         if not isinstance(keys, tuple):
             keys = (keys,)
         seg_key = dict(zip(b_group, keys))
-        b_res.append(analyze_segment(seg_key, seg, df, has_requests, b_fb, b_fbg, ml_knowledge, elasticity_map, bid_map, cut_bias_map))
+        b_res.append(analyze_segment(seg_key, seg, df, has_requests, b_fb, b_fbg, ml_knowledge, elasticity_map, bid_map, cut_bias_map, anchor_map))
 
     basic_full = pd.DataFrame(b_res)
     basic_out  = compress(basic_full, MAX_OUTPUT_ROWS, b_group)
@@ -960,7 +1498,7 @@ def run_pipeline(df, has_requests, has_date, date_str="", bid_map=None, realized
         if not isinstance(keys, tuple):
             keys = (keys,)
         seg_key = dict(zip(d_group, keys))
-        d_res.append(analyze_segment(seg_key, seg, df, has_requests, d_fb, d_fbg, ml_knowledge, elasticity_map, bid_map, cut_bias_map))
+        d_res.append(analyze_segment(seg_key, seg, df, has_requests, d_fb, d_fbg, ml_knowledge, elasticity_map, bid_map, cut_bias_map, anchor_map))
 
     detailed_full = pd.DataFrame(d_res)
     detailed_out  = compress(detailed_full, MAX_OUTPUT_ROWS, d_group)
@@ -1367,6 +1905,11 @@ def download():
         rows = []
         for r in detailed:
             ad_unit_str = str(r.get('ad_unit', ''))
+            # In tag-level mode ad_unit holds the tag identity, which the dashboard
+            # cannot resolve. Send a real ad-unit name belonging to that tag — the
+            # dashboard maps it back to the same tag and writes the same rule.
+            if TAG_LEVEL:
+                ad_unit_str = _TAG_REP.get(ad_unit_str, ad_unit_str)
             # Prefer the SSP carried on the row; default to google_mcm_apac for APAC-truncated
             # ad-unit names, else google_mcm.
             # APAC seat for Ellipsis-network units (also covers truncated '…' display names)
@@ -1389,6 +1932,16 @@ def download():
 
         df_upr = pd.DataFrame(rows) if rows else pd.DataFrame(
             columns=['country', 'device', 'ad unit', 'os', 'browser', 'ssp', 'floor'])
+
+        # One row per deployable key. Two rows for the same rule would race, and the
+        # loser would silently overwrite the winner — the exact failure this redesign
+        # exists to remove. Keep the last (highest-ranked by the compressor).
+        if TAG_LEVEL and not df_upr.empty:
+            _k = ['country', 'device', 'ad unit', 'os', 'browser', 'ssp']
+            _n = len(df_upr)
+            df_upr = df_upr.drop_duplicates(subset=_k, keep='last').reset_index(drop=True)
+            if _n != len(df_upr):
+                logging.info('TAG_LEVEL export: %d rows -> %d unique rules', _n, len(df_upr))
 
         output = io.StringIO()
         df_upr.to_csv(output, index=False)

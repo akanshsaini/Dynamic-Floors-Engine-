@@ -750,6 +750,40 @@ def get_cut_outcome_bias():
         return {}
 
 
+def get_directional_bias():
+    """
+    Per-segment measured memory of floor moves in BOTH directions — the promotion signal
+    for the explore→measure→promote loop. For each (ad_unit, country, device), the median
+    realized revenue change of applied Decreases and of applied Increases, separately.
+    A positive value means moving the floor that way has genuinely paid on this segment,
+    so the engine may deviate from the manual anchor in that direction (winners promoted);
+    negative means it lost (revert/hold). Same comparable-window guard as get_cut_outcome_bias.
+    Returns { (ad_unit, country, device): {'Decrease': med, 'Increase': med} }.
+    """
+    if not os.path.exists(DB_PATH):
+        return {}
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        df = pd.read_sql(f'''
+            SELECT ad_unit, country, device, predicted_direction, rev_change_pct
+            FROM recommendation_outcomes
+            WHERE applied = 1 AND predicted_direction IN ('Decrease', 'Increase')
+              AND ABS(imp_change_pct) <= 60 AND ecpm_change_pct > -30
+              AND {_RECENT_FILTER_OUTCOMES}
+        ''', conn)
+        conn.close()
+        if df.empty:
+            return {}
+        out = {}
+        g = df.groupby(['ad_unit', 'country', 'device', 'predicted_direction'])['rev_change_pct'].median()
+        for (a, c, d, direction), v in g.items():
+            out.setdefault((a, c, d), {})[direction] = float(v)
+        return out
+    except Exception as e:
+        logging.error(f"Directional-bias query failed: {e}")
+        return {}
+
+
 def get_realized_uplift():
     """
     MEASURED (not modeled) uplift from applied recommendations. Aggregates the real

@@ -1,0 +1,60 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+    body { margin: 0; }
+    a { color: #0D5C63; } a:hover { color: #094A50; }
+  </style>
+</helmet>
+<div style="width: 880px; height: 470px; box-sizing: border-box; padding: 36px 40px; background: #EEF2F0; font-family: 'Segoe UI', system-ui, sans-serif; color: #2C3A37; display: flex; flex-direction: column; gap: 20px">
+
+  <div style="display: flex; flex-direction: column; gap: 7px">
+    <div style="font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; font-weight: 700; color: #5E6D69">What stops it going wrong</div>
+    <div style="font-family: Constantia, 'Palatino Linotype', Georgia, serif; font-size: 27px; line-height: 1.15; color: #16211F">Five checks, any one of which can halt it</div>
+    <div style="font-size: 13.5px; color: #2C3A37; max-width: 66ch">Each of these exists because it already caught something real. Stopping is always the safe outcome &mdash; yesterday's prices simply stay live.</div>
+  </div>
+
+  <div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; flex-grow: 1">
+
+    <div style="background: #FBFCFB; border: 1px solid #D3DCD8; border-left: 3px solid #0D5C63; border-radius: 8px; padding: 14px 16px; display: flex; flex-direction: column; gap: 4px">
+      <div style="font-family: Constantia, Georgia, serif; font-size: 15px; color: #16211F">Is the report real?</div>
+      <div style="font-size: 12.5px; line-height: 1.45; color: #2C3A37">A half-written export looks exactly like a demand collapse, and would drag every price down with it. Anything under 60% of normal size is refused.</div>
+    </div>
+
+    <div style="background: #FBFCFB; border: 1px solid #D3DCD8; border-left: 3px solid #9C2E2A; border-radius: 8px; padding: 14px 16px; display: flex; flex-direction: column; gap: 4px">
+      <div style="font-family: Constantia, Georgia, serif; font-size: 15px; color: #16211F">Did revenue collapse?</div>
+      <div style="font-size: 12.5px; line-height: 1.45; color: #2C3A37">Compared against what that weekday normally earns, not a flat number. A genuine drop two days running resets everything to the human prices.</div>
+    </div>
+
+    <div style="background: #FBFCFB; border: 1px solid #D3DCD8; border-left: 3px solid #0D5C63; border-radius: 8px; padding: 14px 16px; display: flex; flex-direction: column; gap: 4px">
+      <div style="font-family: Constantia, Georgia, serif; font-size: 15px; color: #16211F">Is this change real?</div>
+      <div style="font-size: 12.5px; line-height: 1.45; color: #2C3A37">Prices identical to what is already live are dropped, so the daily change list only contains things that actually changed.</div>
+    </div>
+
+    <div style="background: #FBFCFB; border: 1px solid #D3DCD8; border-left: 3px solid #96661A; border-radius: 8px; padding: 14px 16px; display: flex; flex-direction: column; gap: 4px">
+      <div style="font-family: Constantia, Georgia, serif; font-size: 15px; color: #16211F">How much may move today?</div>
+      <div style="font-size: 12.5px; line-height: 1.45; color: #2C3A37">At most 30% of slots, biggest impact first. So it is a priority queue as much as a limit &mdash; the valuable changes always ship first.</div>
+    </div>
+
+    <div style="background: #FBFCFB; border: 1px solid #D3DCD8; border-left: 3px solid #9C2E2A; border-radius: 8px; padding: 14px 16px; display: flex; flex-direction: column; gap: 4px; grid-column: span 2">
+      <div style="font-family: Constantia, Georgia, serif; font-size: 15px; color: #16211F">Did yesterday's change hurt?</div>
+      <div style="font-size: 12.5px; line-height: 1.45; color: #2C3A37">Any slot that fell while the rest of its site held steady gets yesterday's price back automatically. Compared against its own site, not against zero &mdash; when a whole site drops together that is a traffic event, and reverting there would throw away good prices.</div>
+    </div>
+
+  </div>
+
+</div>
+</x-dc>
+<script data-dc-script data-props='{"$preview":{"width":880,"height":470}}'>
+class Component extends DCLogic {
+  renderVals() { return {}; }
+}
+</script>
+</body>
+</html>

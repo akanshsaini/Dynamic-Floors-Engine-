@@ -1,0 +1,11 @@
+{
+  "artboards": [
+    { "file": "Main.dc.html",   "x": 0,    "y": 0,   "w": 880, "h": 560, "title": "The loop" },
+    { "file": "Demo.dc.html",   "x": 940,  "y": 0,   "w": 900, "h": 620, "title": "Demo - try it" },
+    { "file": "Safety.dc.html", "x": 0,    "y": 700, "w": 880, "h": 470, "title": "Safety checks" }
+  ],
+  "annotations": [
+    { "id": "start-here", "x": 940, "y": -110, "w": 300, "text": "Click the rows on the left of this board.\nEvery price it shows is real output from the live engine." }
+  ],
+  "launch": { "view": "canvas" }
+}
